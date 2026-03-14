@@ -1,0 +1,1125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# llama-reaper — watchdog that detects and kills idle llama.cpp processes
+# Last-ditch safety net for shared GPU servers.
+#
+# Two modes:
+#   User mode (default): manages only current user's processes
+#   System mode (--system): manages ALL users' processes (needs root for install)
+#
+# Usage: llama-reaper [--max-idle MINUTES] [--dry-run] [--verbose] [--force]
+#        llama-reaper list
+#        llama-reaper install [--system] [--interval MINUTES]
+#        llama-reaper uninstall [--system]
+
+readonly VERSION="1.0.0"
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_PATH="$(readlink -f "$0")"
+USER_STATE_DIR="${HOME}/.local/state/llama-reaper"
+REAPER_STATE_DIR="${USER_STATE_DIR}/reaper"
+readonly USER_LOG="${USER_STATE_DIR}/reaper.log"
+readonly SYSTEM_LOG="/var/log/llama-reaper.log"
+readonly CRON_MARKER="# llama-reaper-managed"
+readonly SYSTEM_CRON_FILE="/etc/cron.d/llama-reaper"
+
+# Llama process name patterns (extended regex for grep -E)
+readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama\.cpp'
+
+# Scoring thresholds
+readonly SCORE_WARN=6
+readonly SCORE_KILL=8
+
+# Defaults
+MAX_IDLE_MINUTES=30
+DRY_RUN=false
+VERBOSE=false
+FORCE=false
+SYSTEM_MODE=false
+
+# ---------- Usage / Help ----------
+
+usage() {
+    cat <<'EOF'
+Usage: llama-reaper [OPTIONS] [COMMAND]
+
+Watchdog that detects and kills idle llama.cpp processes.
+
+Commands:
+  list                     Show all llama.cpp processes with idle scores
+  install [OPTIONS]        Install as a recurring cron job
+  uninstall [OPTIONS]      Remove the cron job
+
+Options (main / default command):
+  --max-idle MINUTES       Minimum age (minutes) for a process to be eligible
+                           for reaping (default: 30)
+  --dry-run                Show what would happen without killing anything
+  --verbose                Show detailed idle scoring for each process
+  --force                  Skip two-phase warn-then-kill; kill immediately
+                           if score >= threshold
+  --help, -h               Show this help message
+  --version                Show version
+
+Install/Uninstall Options:
+  --system                 System-wide mode (manages all users; needs sudo)
+  --interval MINUTES       How often the reaper runs (default: 5)
+  --max-idle MINUTES       Bake --max-idle into the cron entry (default: 30)
+
+Scoring System:
+  No GPU memory at all ................ +3
+  GPU memory held, utilization 0% ..... +3
+  No CPU time change since last run ... +3
+  No network connections (servers) .... +2
+  Running > 2 hours ................... +1
+  Running > 8 hours ................... +2
+  State file with expired timeout ..... +5
+
+  Score >= 6: WARN (write marker, log warning)
+  Score >= 8: KILL (if warned > 5min ago)
+
+Examples:
+  llama-reaper                        # Run once in user mode
+  llama-reaper --dry-run --verbose    # See what would happen
+  llama-reaper list                   # Show all llama processes
+  llama-reaper install --interval 3   # Cron every 3 minutes (user)
+  llama-reaper install --system       # Cron every 5 minutes (root)
+  llama-reaper uninstall              # Remove user cron entry
+EOF
+    exit 0
+}
+
+usage_install() {
+    cat <<'EOF'
+Usage: llama-reaper install [--system] [--interval MINUTES] [--max-idle MINUTES]
+
+Install llama-reaper as a recurring cron job.
+
+Options:
+  --system             Install system-wide (requires sudo). Creates
+                       /etc/cron.d/llama-reaper running as root.
+  --interval MINUTES   How often the reaper runs (default: 5)
+  --max-idle MINUTES   Minimum process age for reaping eligibility (default: 30).
+                       Passed through to the cron entry so each invocation
+                       uses the specified value instead of the default.
+  --help, -h           Show this help message
+
+User mode (default):
+  Adds an entry to the current user's crontab.
+
+System mode (--system):
+  Creates /etc/cron.d/llama-reaper that runs as root, managing
+  ALL users' llama.cpp processes.
+EOF
+    exit 0
+}
+
+usage_uninstall() {
+    cat <<'EOF'
+Usage: llama-reaper uninstall [--system]
+
+Remove the llama-reaper cron job.
+
+Options:
+  --system       Remove the system-wide cron entry (requires sudo)
+  --help, -h     Show this help message
+EOF
+    exit 0
+}
+
+usage_list() {
+    cat <<'EOF'
+Usage: llama-reaper list
+
+Show all llama.cpp processes on the system with diagnostic info.
+
+Displays: PID, user, GPU memory, port, uptime, and idle score.
+This is read-only — no sudo needed (uses ps and nvidia-smi).
+EOF
+    exit 0
+}
+
+# ---------- Logging ----------
+
+log_file() {
+    if [[ "${SYSTEM_MODE}" == true ]]; then
+        echo "${SYSTEM_LOG}"
+    else
+        echo "${USER_LOG}"
+    fi
+}
+
+log_msg() {
+    local level="$1" msg="$2"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local entry="[${ts}] ${level}: ${msg}"
+
+    # Always write to log file
+    local lf
+    lf="$(log_file)"
+    mkdir -p "$(dirname "${lf}")"
+    echo "${entry}" >> "${lf}" 2>/dev/null || true
+
+    # Print to stderr if verbose or if it's a warning/kill
+    if [[ "${VERBOSE}" == true ]] || [[ "${level}" == "KILL" ]] || [[ "${level}" == "WARN" ]] || [[ "${level}" == "ERROR" ]]; then
+        echo "${entry}" >&2
+    fi
+}
+
+die() {
+    printf '[%s] ERROR: %s\n' "$(date '+%H:%M:%S')" "$1" >&2
+    exit "${2:-1}"
+}
+
+# ---------- Utility ----------
+
+# Ensure state directories exist
+ensure_dirs() {
+    mkdir -p "${REAPER_STATE_DIR}"
+}
+
+# Get CLK_TCK for proc stat calculations (cached)
+_CLK_TCK=""
+get_clk_tck() {
+    if [[ -z "${_CLK_TCK}" ]]; then
+        _CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+    fi
+    echo "${_CLK_TCK}"
+}
+
+# Get system boot time in seconds since epoch
+_BOOT_TIME=""
+get_boot_time() {
+    if [[ -z "${_BOOT_TIME}" ]]; then
+        _BOOT_TIME="$(awk '/^btime / {print $2}' /proc/stat 2>/dev/null || echo 0)"
+    fi
+    echo "${_BOOT_TIME}"
+}
+
+# Format seconds into human-readable uptime
+format_uptime() {
+    local seconds="$1"
+    if [[ ${seconds} -lt 60 ]]; then
+        printf '%ds' "${seconds}"
+    elif [[ ${seconds} -lt 3600 ]]; then
+        printf '%dm%ds' "$((seconds / 60))" "$((seconds % 60))"
+    else
+        printf '%dh%dm' "$((seconds / 3600))" "$(((seconds % 3600) / 60))"
+    fi
+}
+
+# Extract a string value from minimal JSON (avoids jq dependency)
+json_str() {
+    local key="$1" data="$2"
+    printf '%s' "${data}" | grep -oP "\"${key}\"\s*:\s*\"\K[^\"]*" 2>/dev/null || echo ""
+}
+
+# Extract a numeric value from minimal JSON
+json_num() {
+    local key="$1" data="$2"
+    printf '%s' "${data}" | grep -oP "\"${key}\"\s*:\s*\K[0-9]+" 2>/dev/null || echo "0"
+}
+
+# ---------- Process Discovery ----------
+
+# Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
+# In user mode, filters to current user only.
+find_llama_processes() {
+    local ps_output
+    # Use ps to get PID, USER, full command — works without sudo
+    ps_output="$(ps -eo pid=,user=,args= 2>/dev/null)" || return 0
+
+    local current_user
+    current_user="$(whoami)"
+
+    while IFS= read -r line; do
+        # Skip empty lines
+        [[ -z "${line}" ]] && continue
+
+        # Parse: leading spaces, PID, spaces, USER, spaces, ARGS
+        local pid user args
+        pid="$(echo "${line}" | awk '{print $1}')"
+        user="$(echo "${line}" | awk '{print $2}')"
+        args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+
+        # Check if this is a llama process
+        if ! echo "${args}" | grep -qE "${LLAMA_PATTERN}"; then
+            continue
+        fi
+
+        # Skip ourselves
+        if [[ "${pid}" == "$$" ]]; then
+            continue
+        fi
+
+        # In user mode, skip processes not owned by current user
+        if [[ "${SYSTEM_MODE}" == false ]] && [[ "${user}" != "${current_user}" ]]; then
+            continue
+        fi
+
+        echo "${pid} ${user} ${args}"
+    done <<< "${ps_output}"
+}
+
+# ---------- GPU Process Info ----------
+
+# Returns associative-array-like output: "PID GPU_MEM_MIB" per line
+get_gpu_processes() {
+    nvidia-smi --query-compute-apps=pid,used_gpu_memory \
+        --format=csv,noheader,nounits 2>/dev/null | \
+        sed 's/,/ /g; s/^[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+
+# Get GPU memory for a specific PID (returns MiB or empty)
+get_gpu_mem_for_pid() {
+    local target_pid="$1"
+    local gpu_procs
+    gpu_procs="$(get_gpu_processes)"
+    [[ -z "${gpu_procs}" ]] && return 0
+
+    while IFS= read -r line; do
+        local pid mem
+        pid="$(echo "${line}" | awk '{print $1}')"
+        mem="$(echo "${line}" | awk '{print $2}')"
+        if [[ "${pid}" == "${target_pid}" ]]; then
+            echo "${mem}"
+            return 0
+        fi
+    done <<< "${gpu_procs}"
+}
+
+# Check if a PID has active GPU SM utilization (returns "active", "idle", or "unknown")
+# Uses nvidia-smi pmon for per-process utilization, falls back to device-level query.
+get_gpu_utilization_for_pid() {
+    local target_pid="$1"
+
+    # Try per-process monitoring first (pmon -c 1 -s u)
+    local pmon_output
+    pmon_output="$(nvidia-smi pmon -c 1 -s u 2>/dev/null)" || pmon_output=""
+
+    if [[ -n "${pmon_output}" ]]; then
+        # pmon output: "# gpu  pid  type  sm  mem  enc  dec  jpg  ofa  command"
+        # Skip header lines starting with #, find our PID
+        local sm_util
+        sm_util="$(echo "${pmon_output}" | awk -v p="${target_pid}" '!/^#/ && $2 == p {print $4; exit}')"
+
+        if [[ -n "${sm_util}" ]]; then
+            if [[ "${sm_util}" == "-" ]] || [[ "${sm_util}" -eq 0 ]]; then
+                echo "idle"
+            else
+                echo "active"
+            fi
+            return 0
+        fi
+    fi
+
+    # Fallback: check overall GPU utilization as a heuristic
+    local gpu_util
+    gpu_util="$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1)" || gpu_util=""
+
+    if [[ -n "${gpu_util}" ]]; then
+        # Trim whitespace
+        gpu_util="$(echo "${gpu_util}" | tr -d '[:space:]')"
+        if [[ "${gpu_util}" -eq 0 ]]; then
+            echo "idle"
+        else
+            echo "unknown"  # GPU is busy but we can't attribute it to this PID
+        fi
+        return 0
+    fi
+
+    echo "unknown"
+}
+
+# ---------- Process Info Extraction ----------
+
+# Get CPU time (utime + stime) from /proc/PID/stat
+# Fields 14 and 15 (1-indexed) are utime and stime in clock ticks
+get_cpu_time() {
+    local pid="$1"
+    local stat_file="/proc/${pid}/stat"
+    [[ -f "${stat_file}" ]] || return 1
+
+    local stat_data
+    stat_data="$(cat "${stat_file}" 2>/dev/null)" || return 1
+
+    # /proc/pid/stat has comm in parens which may contain spaces
+    # Strip everything up to and including the last ')' to get fields starting at field 3
+    local after_comm
+    after_comm="${stat_data##*) }"
+
+    # Fields after comm: state(3) ppid(4) ... utime(14-2=12) stime(15-2=13)
+    # Since we stripped fields 1-2, utime is field 12, stime is field 13
+    local utime stime
+    utime="$(echo "${after_comm}" | awk '{print $12}')"
+    stime="$(echo "${after_comm}" | awk '{print $13}')"
+
+    if [[ -n "${utime}" ]] && [[ -n "${stime}" ]]; then
+        echo "$(( utime + stime ))"
+    else
+        return 1
+    fi
+}
+
+# Get process start time in epoch seconds from /proc/PID/stat
+# Field 22 (1-indexed) is starttime in clock ticks since boot
+get_process_start_epoch() {
+    local pid="$1"
+    local stat_file="/proc/${pid}/stat"
+    [[ -f "${stat_file}" ]] || return 1
+
+    local stat_data
+    stat_data="$(cat "${stat_file}" 2>/dev/null)" || return 1
+
+    local after_comm
+    after_comm="${stat_data##*) }"
+
+    # starttime is field 22, which is field 20 after stripping fields 1-2
+    local starttime
+    starttime="$(echo "${after_comm}" | awk '{print $20}')"
+    [[ -n "${starttime}" ]] || return 1
+
+    local clk_tck boot_time
+    clk_tck="$(get_clk_tck)"
+    boot_time="$(get_boot_time)"
+
+    echo "$(( boot_time + starttime / clk_tck ))"
+}
+
+# Get the port a process is listening on (for llama-server)
+get_listen_port() {
+    local pid="$1"
+    # Use ss to find LISTEN sockets for this PID
+    local port
+    port="$(ss -tlnp 2>/dev/null | grep "pid=${pid}[,)]" | \
+        grep -oP ':\K[0-9]+(?=\s)' | head -1)" || true
+    echo "${port}"
+}
+
+# Count ESTABLISHED connections to a given port for a given PID
+get_established_connections() {
+    local pid="$1" port="$2"
+    [[ -z "${port}" ]] && echo "0" && return 0
+
+    local count
+    count="$(ss -tnp "( sport = :${port} )" 2>/dev/null | \
+        grep -c "ESTAB" 2>/dev/null)" || count=0
+    echo "${count}"
+}
+
+# Get model name from state file or command line
+get_model_name() {
+    local pid="$1" cmdline="$2"
+    local model=""
+
+    # Try state file first
+    local state_file="${USER_STATE_DIR}/${pid}.json"
+    if [[ -f "${state_file}" ]]; then
+        local data
+        data="$(cat "${state_file}" 2>/dev/null)" || true
+        model="$(json_str "model" "${data}")"
+    fi
+
+    # Fall back to parsing command line for -m or --model
+    if [[ -z "${model}" ]] || [[ "${model}" == "unknown" ]]; then
+        model="$(echo "${cmdline}" | grep -oP '(-m|--model)\s+\K\S+' | head -1)" || true
+    fi
+
+    if [[ -n "${model}" ]]; then
+        basename "${model}" 2>/dev/null || echo "${model}"
+    else
+        echo "unknown"
+    fi
+}
+
+# ---------- CPU Time Two-Sample Comparison ----------
+
+# Save current CPU time sample for a PID
+save_cpu_sample() {
+    local pid="$1" cpu_time="$2"
+    local sample_file="${REAPER_STATE_DIR}/${pid}.cpu"
+    echo "$(date +%s) ${cpu_time}" > "${sample_file}"
+}
+
+# Load previous CPU time sample for a PID
+# Returns "epoch cpu_time" or empty if no sample
+load_cpu_sample() {
+    local pid="$1"
+    local sample_file="${REAPER_STATE_DIR}/${pid}.cpu"
+    if [[ -f "${sample_file}" ]]; then
+        cat "${sample_file}" 2>/dev/null || true
+    fi
+}
+
+# ---------- State File Timeout Check ----------
+
+# Check if the llama-serve state file indicates the process should have timed out
+# Returns 0 (true) if expired, 1 (false) otherwise
+check_state_file_expired() {
+    local pid="$1"
+    local state_file="${USER_STATE_DIR}/${pid}.json"
+    [[ -f "${state_file}" ]] || return 1
+
+    local data
+    data="$(cat "${state_file}" 2>/dev/null)" || return 1
+
+    local start_epoch timeout_min
+    start_epoch="$(json_num "start_epoch" "${data}")"
+    timeout_min="$(json_num "timeout_minutes" "${data}")"
+
+    [[ "${start_epoch}" -gt 0 ]] || return 1
+    [[ "${timeout_min}" -gt 0 ]] || return 1
+
+    local now elapsed_min
+    now="$(date +%s)"
+    elapsed_min="$(( (now - start_epoch) / 60 ))"
+
+    # If process has been running longer than its configured timeout,
+    # the wrapper should have killed it — something went wrong
+    if [[ ${elapsed_min} -gt $(( timeout_min * 2 )) ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+# ---------- Idle Scoring ----------
+
+# Calculate idle score for a process.
+# Prints "SCORE reason1; reason2; ..."
+# Also saves CPU sample for next run.
+calculate_idle_score() {
+    local pid="$1" user="$2" cmdline="$3"
+    local score=0
+    local reasons=()
+    local now
+    now="$(date +%s)"
+
+    # --- a. GPU compute activity ---
+    local gpu_mem
+    gpu_mem="$(get_gpu_mem_for_pid "${pid}")"
+    if [[ -z "${gpu_mem}" ]] || [[ "${gpu_mem}" == "0" ]]; then
+        score=$((score + 3))
+        reasons+=("no GPU memory (+3)")
+    else
+        # Process holds GPU memory — check if it's actually computing
+        local gpu_util_status
+        gpu_util_status="$(get_gpu_utilization_for_pid "${pid}")"
+        if [[ "${gpu_util_status}" == "active" ]]; then
+            reasons+=("GPU mem: ${gpu_mem}MiB, actively computing (+0)")
+        elif [[ "${gpu_util_status}" == "idle" ]]; then
+            score=$((score + 3))
+            reasons+=("GPU mem: ${gpu_mem}MiB, utilization 0% — holding memory idle (+3)")
+        else
+            # Unknown — can't determine, give benefit of the doubt
+            reasons+=("GPU mem: ${gpu_mem}MiB, utilization unknown (+0)")
+        fi
+    fi
+
+    # --- b. CPU time change (two-sample) ---
+    local current_cpu
+    current_cpu="$(get_cpu_time "${pid}" 2>/dev/null)" || current_cpu=""
+
+    if [[ -n "${current_cpu}" ]]; then
+        local prev_sample
+        prev_sample="$(load_cpu_sample "${pid}")"
+
+        if [[ -n "${prev_sample}" ]]; then
+            local prev_epoch prev_cpu
+            prev_epoch="$(echo "${prev_sample}" | awk '{print $1}')"
+            prev_cpu="$(echo "${prev_sample}" | awk '{print $2}')"
+
+            local time_delta=$((now - prev_epoch))
+            # Only compare if previous sample is at least 20s old
+            if [[ ${time_delta} -ge 20 ]]; then
+                local cpu_delta=$((current_cpu - prev_cpu))
+                # Consider "idle" if less than 1 tick/second (timer housekeeping noise)
+                local tick_rate=0
+                if [[ ${time_delta} -gt 0 ]]; then
+                    tick_rate=$(( cpu_delta / time_delta ))
+                fi
+                if [[ ${cpu_delta} -le 0 ]] || [[ ${tick_rate} -lt 1 ]]; then
+                    score=$((score + 3))
+                    reasons+=("CPU near-idle: +${cpu_delta} ticks in ${time_delta}s (<1 tick/s) (+3)")
+                else
+                    reasons+=("CPU delta: +${cpu_delta} ticks in ${time_delta}s (+0)")
+                fi
+            else
+                reasons+=("CPU sample too recent (${time_delta}s ago), skipping (+0)")
+            fi
+        else
+            reasons+=("no previous CPU sample, first run (+0)")
+        fi
+
+        # Save current sample for next run
+        save_cpu_sample "${pid}" "${current_cpu}"
+    else
+        reasons+=("cannot read CPU time (+0)")
+    fi
+
+    # --- c. Network connections (for servers) ---
+    local port
+    port="$(get_listen_port "${pid}")"
+    if [[ -n "${port}" ]]; then
+        local conn_count
+        conn_count="$(get_established_connections "${pid}" "${port}")"
+        if [[ "${conn_count}" -eq 0 ]]; then
+            score=$((score + 2))
+            reasons+=("no connections on port ${port} (+2)")
+        else
+            reasons+=("${conn_count} connections on port ${port} (+0)")
+        fi
+    else
+        # Not a server (llama-cli etc) — skip network check
+        reasons+=("not listening on any port (+0)")
+    fi
+
+    # --- d. State file expired timeout ---
+    if check_state_file_expired "${pid}"; then
+        score=$((score + 5))
+        reasons+=("state file timeout expired (+5)")
+    fi
+
+    # --- e. Process age ---
+    local start_epoch
+    start_epoch="$(get_process_start_epoch "${pid}" 2>/dev/null)" || start_epoch=0
+    if [[ ${start_epoch} -gt 0 ]]; then
+        local age_seconds=$((now - start_epoch))
+        local age_hours=$((age_seconds / 3600))
+        local age_minutes=$((age_seconds / 60))
+
+        if [[ ${age_hours} -ge 8 ]]; then
+            score=$((score + 2))
+            reasons+=("running > 8h ($(format_uptime "${age_seconds}")) (+2)")
+        elif [[ ${age_hours} -ge 2 ]]; then
+            score=$((score + 1))
+            reasons+=("running > 2h ($(format_uptime "${age_seconds}")) (+1)")
+        else
+            reasons+=("uptime $(format_uptime "${age_seconds}") (+0)")
+        fi
+
+        # Check --max-idle: process must be older than max-idle minutes to be eligible
+        if [[ ${age_minutes} -lt ${MAX_IDLE_MINUTES} ]]; then
+            # Process is too young — zero out the score
+            score=0
+            reasons+=("process younger than --max-idle (${MAX_IDLE_MINUTES}m), NOT eligible")
+        fi
+    fi
+
+    # Return score and reasons
+    local reason_str
+    reason_str="$(IFS='; '; echo "${reasons[*]}")"
+    echo "${score} ${reason_str}"
+}
+
+# ---------- Warn / Kill Logic ----------
+
+# Write a warning marker for a PID
+write_warn_marker() {
+    local pid="$1"
+    local marker="${REAPER_STATE_DIR}/${pid}.warned"
+    echo "$(date +%s)" > "${marker}"
+}
+
+# Check if a warn marker exists and is older than 5 minutes
+# Returns 0 if exists and old enough, 1 otherwise
+check_warn_marker_aged() {
+    local pid="$1"
+    local marker="${REAPER_STATE_DIR}/${pid}.warned"
+    [[ -f "${marker}" ]] || return 1
+
+    local warned_epoch
+    warned_epoch="$(cat "${marker}" 2>/dev/null)" || return 1
+    local now
+    now="$(date +%s)"
+    local age=$((now - warned_epoch))
+
+    if [[ ${age} -ge 300 ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Remove all reaper state files for a PID
+cleanup_pid_files() {
+    local pid="$1"
+    rm -f "${REAPER_STATE_DIR}/${pid}.warned" \
+          "${REAPER_STATE_DIR}/${pid}.cpu" \
+          "${USER_STATE_DIR}/${pid}.json" 2>/dev/null || true
+}
+
+# Kill a process: SIGTERM, wait 10s, SIGKILL if needed
+kill_process() {
+    local pid="$1" user="$2" model="$3" score="$4" reason="$5"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_msg "KILL(dry)" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
+        echo "  [DRY-RUN] Would KILL PID ${pid} (${user}, ${model}, score=${score})"
+        return 0
+    fi
+
+    log_msg "KILL" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
+    echo "  KILLING PID ${pid} (${user}, ${model}, score=${score})"
+
+    # SIGTERM first
+    kill -TERM "${pid}" 2>/dev/null || true
+
+    # Wait up to 10s
+    local waited=0
+    while kill -0 "${pid}" 2>/dev/null && [[ ${waited} -lt 10 ]]; do
+        sleep 1
+        ((waited++))
+    done
+
+    # SIGKILL if still alive
+    if kill -0 "${pid}" 2>/dev/null; then
+        log_msg "KILL" "PID=${pid} still alive after 10s, sending SIGKILL"
+        kill -KILL "${pid}" 2>/dev/null || true
+    fi
+
+    cleanup_pid_files "${pid}"
+}
+
+# ---------- Main Reap Logic ----------
+
+reap() {
+    ensure_dirs
+
+    local processes
+    processes="$(find_llama_processes)"
+
+    if [[ -z "${processes}" ]]; then
+        [[ "${VERBOSE}" == true ]] && echo "No llama.cpp processes found."
+        return 0
+    fi
+
+    # Pre-fetch GPU process info once (avoid repeated nvidia-smi calls)
+    # (Individual calls in get_gpu_mem_for_pid use the cached approach via function)
+
+    local found_any=false
+
+    while IFS= read -r proc_line; do
+        [[ -z "${proc_line}" ]] && continue
+        found_any=true
+
+        local pid user cmdline
+        pid="$(echo "${proc_line}" | awk '{print $1}')"
+        user="$(echo "${proc_line}" | awk '{print $2}')"
+        cmdline="$(echo "${proc_line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+
+        # Verify process still exists
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            cleanup_pid_files "${pid}"
+            continue
+        fi
+
+        local model
+        model="$(get_model_name "${pid}" "${cmdline}")"
+
+        # Calculate idle score
+        local score_result score reason
+        score_result="$(calculate_idle_score "${pid}" "${user}" "${cmdline}")"
+        score="$(echo "${score_result}" | awk '{print $1}')"
+        reason="$(echo "${score_result}" | cut -d' ' -f2-)"
+
+        if [[ "${VERBOSE}" == true ]]; then
+            echo "  PID ${pid} (${user}, ${model}): score=${score}"
+            echo "    ${reason}"
+        fi
+
+        # Decide action based on score
+        if [[ ${score} -ge ${SCORE_KILL} ]]; then
+            if [[ "${FORCE}" == true ]]; then
+                # Force mode: kill immediately
+                kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
+            elif check_warn_marker_aged "${pid}"; then
+                # Previously warned and marker is old enough — kill
+                kill_process "${pid}" "${user}" "${model}" "${score}" "${reason}"
+            elif [[ -f "${REAPER_STATE_DIR}/${pid}.warned" ]]; then
+                # Warned but not aged yet — skip
+                if [[ "${VERBOSE}" == true ]]; then
+                    echo "    → Already warned, waiting for grace period"
+                fi
+                log_msg "SKIP" "PID=${pid} user=${user} model=${model} score=${score} reason=[warned, grace period]"
+            else
+                # First time seeing this — warn
+                write_warn_marker "${pid}"
+                if [[ "${DRY_RUN}" == true ]]; then
+                    log_msg "WARN(dry)" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
+                    echo "  [DRY-RUN] Would WARN PID ${pid} (${user}, ${model}, score=${score})"
+                else
+                    log_msg "WARN" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
+                    echo "  WARNING PID ${pid} (${user}, ${model}, score=${score}) — will kill on next run"
+                fi
+            fi
+        elif [[ ${score} -ge ${SCORE_WARN} ]]; then
+            # Warn threshold but not kill threshold
+            if [[ ! -f "${REAPER_STATE_DIR}/${pid}.warned" ]]; then
+                write_warn_marker "${pid}"
+                if [[ "${DRY_RUN}" == true ]]; then
+                    log_msg "WARN(dry)" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
+                    echo "  [DRY-RUN] Would WARN PID ${pid} (${user}, ${model}, score=${score})"
+                else
+                    log_msg "WARN" "PID=${pid} user=${user} model=${model} score=${score} reason=[${reason}]"
+                    echo "  WARNING PID ${pid} (${user}, ${model}, score=${score})"
+                fi
+            else
+                if [[ "${VERBOSE}" == true ]]; then
+                    echo "    → Already warned (score below kill threshold)"
+                fi
+            fi
+        else
+            # Below warn threshold — clean up any stale markers
+            if [[ -f "${REAPER_STATE_DIR}/${pid}.warned" ]]; then
+                rm -f "${REAPER_STATE_DIR}/${pid}.warned"
+                [[ "${VERBOSE}" == true ]] && echo "    → Score dropped, cleared warning marker"
+            fi
+            log_msg "SKIP" "PID=${pid} user=${user} model=${model} score=${score} reason=[below threshold]"
+        fi
+    done <<< "${processes}"
+
+    if [[ "${found_any}" == false ]]; then
+        [[ "${VERBOSE}" == true ]] && echo "No llama.cpp processes found."
+    fi
+
+    # Clean up stale reaper files for PIDs that no longer exist
+    cleanup_stale_reaper_files
+}
+
+# Remove reaper state files for PIDs that no longer exist
+cleanup_stale_reaper_files() {
+    shopt -s nullglob
+    local files=("${REAPER_STATE_DIR}"/*.warned "${REAPER_STATE_DIR}"/*.cpu)
+    shopt -u nullglob
+
+    for f in "${files[@]}"; do
+        local basename_f
+        basename_f="$(basename "${f}")"
+        local pid="${basename_f%%.*}"
+        if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+            rm -f "${f}"
+        fi
+    done
+}
+
+# ---------- List Subcommand ----------
+
+cmd_list() {
+    # Show ALL llama processes regardless of mode (read-only diagnostic)
+    local ps_output
+    ps_output="$(ps -eo pid=,user=,args= 2>/dev/null)" || { echo "Failed to run ps"; exit 1; }
+
+    # Get GPU processes once
+    local gpu_procs
+    gpu_procs="$(get_gpu_processes)"
+
+    # Collect state dirs to check (user dir + system dir for complete picture)
+    local system_state_dir="/var/lib/llama-reaper/reaper"
+    local state_dirs=("${REAPER_STATE_DIR}")
+    if [[ "${REAPER_STATE_DIR}" != "${system_state_dir}" ]] && [[ -d "${system_state_dir}" ]]; then
+        state_dirs+=("${system_state_dir}")
+    fi
+
+    local entries=()
+    local now
+    now="$(date +%s)"
+
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+
+        local pid user args
+        pid="$(echo "${line}" | awk '{print $1}')"
+        user="$(echo "${line}" | awk '{print $2}')"
+        args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+
+        if ! echo "${args}" | grep -qE "${LLAMA_PATTERN}"; then
+            continue
+        fi
+
+        # Skip ourselves
+        [[ "${pid}" == "$$" ]] && continue
+
+        # GPU memory
+        local gpu_mem="-"
+        if [[ -n "${gpu_procs}" ]]; then
+            local mem
+            mem="$(echo "${gpu_procs}" | awk -v p="${pid}" '$1 == p {print $2}')"
+            [[ -n "${mem}" ]] && gpu_mem="${mem}MiB"
+        fi
+
+        # Port
+        local port
+        port="$(get_listen_port "${pid}")"
+        [[ -z "${port}" ]] && port="-"
+
+        # Uptime
+        local start_epoch uptime_str="-"
+        start_epoch="$(get_process_start_epoch "${pid}" 2>/dev/null)" || start_epoch=0
+        if [[ ${start_epoch} -gt 0 ]]; then
+            local age=$((now - start_epoch))
+            uptime_str="$(format_uptime "${age}")"
+        fi
+
+        # Model
+        local model
+        model="$(get_model_name "${pid}" "${args}")"
+
+        # Idle score (quick calculation — ensure dirs exist)
+        ensure_dirs
+        local score_result score
+        score_result="$(calculate_idle_score "${pid}" "${user}" "${args}")"
+        score="$(echo "${score_result}" | awk '{print $1}')"
+
+        # Check for warn markers in ALL state dirs
+        local warned=""
+        for sdir in "${state_dirs[@]}"; do
+            if [[ -f "${sdir}/${pid}.warned" ]]; then
+                warned="W"
+                break
+            fi
+        done
+
+        entries+=("${pid}|${user}|${gpu_mem}|${port}|${uptime_str}|${score}${warned}|${model}")
+    done <<< "${ps_output}"
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        echo "No llama.cpp processes found."
+        return 0
+    fi
+
+    # Table header
+    printf '%-8s %-12s %-10s %-7s %-10s %-6s %s\n' \
+        "PID" "USER" "GPU_MEM" "PORT" "UPTIME" "SCORE" "MODEL"
+    printf '%-8s %-12s %-10s %-7s %-10s %-6s %s\n' \
+        "-------" "------------" "----------" "-------" "----------" "------" "-----"
+
+    for entry in "${entries[@]}"; do
+        IFS='|' read -r pid user gpu_mem port uptime score model <<< "${entry}"
+        printf '%-8s %-12s %-10s %-7s %-10s %-6s %s\n' \
+            "${pid}" "${user}" "${gpu_mem}" "${port}" "${uptime}" "${score}" "${model}"
+    done
+
+    echo ""
+    echo "${#entries[@]} llama.cpp process(es) found."
+    echo "(Score suffix: W=warned)"
+}
+
+# ---------- Install / Uninstall Subcommands ----------
+
+cmd_install() {
+    local system=false
+    local interval=5
+    local max_idle=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --system)   system=true; shift ;;
+            --interval)
+                [[ -n "${2:-}" ]] || die "--interval requires a value"
+                interval="$2"; shift 2
+                ;;
+            --max-idle)
+                [[ -n "${2:-}" ]] || die "--max-idle requires a value"
+                max_idle="$2"; shift 2
+                ;;
+            --help|-h)  usage_install ;;
+            *)          die "Unknown install option: $1" ;;
+        esac
+    done
+
+    if [[ "${system}" == true ]]; then
+        install_system "${interval}" "${max_idle}"
+    else
+        install_user "${interval}" "${max_idle}"
+    fi
+}
+
+install_user() {
+    local interval="$1"
+    local max_idle="${2:-}"
+
+    # Check if already installed
+    local existing
+    existing="$(crontab -l 2>/dev/null || true)"
+    if echo "${existing}" | grep -q "${CRON_MARKER}"; then
+        echo "llama-reaper cron entry already exists. Use 'llama-reaper uninstall' first."
+        echo "Current entry:"
+        echo "${existing}" | grep "${CRON_MARKER}" -A1
+        return 1
+    fi
+
+    local max_idle_flag=""
+    if [[ -n "${max_idle}" ]]; then
+        max_idle_flag=" --max-idle ${max_idle}"
+    fi
+
+    local cron_line="*/${interval} * * * * ${SCRIPT_PATH}${max_idle_flag} ${CRON_MARKER}"
+
+    # Add to crontab
+    (echo "${existing}"; echo "${cron_line}") | crontab -
+
+    echo "Installed user cron: runs every ${interval} minutes"
+    echo "  ${cron_line}"
+    echo ""
+    echo "View with: crontab -l"
+    echo "Remove with: llama-reaper uninstall"
+}
+
+install_system() {
+    local interval="$1"
+    local max_idle="${2:-}"
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        local extra_args=()
+        [[ -n "${max_idle}" ]] && extra_args+=(--max-idle "${max_idle}")
+        echo "System install requires root. Re-running with sudo..."
+        exec sudo "${SCRIPT_PATH}" install --system --interval "${interval}" "${extra_args[@]}"
+    fi
+
+    local max_idle_flag=""
+    if [[ -n "${max_idle}" ]]; then
+        max_idle_flag=" --max-idle ${max_idle}"
+    fi
+
+    # Create /etc/cron.d entry
+    cat > "${SYSTEM_CRON_FILE}" <<EOF
+# llama-reaper: watchdog for idle llama.cpp processes
+# Installed by: llama-reaper install --system
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+
+*/${interval} * * * * root ${SCRIPT_PATH} --system-run${max_idle_flag} ${CRON_MARKER}
+EOF
+
+    chmod 644 "${SYSTEM_CRON_FILE}"
+
+    echo "Installed system cron: ${SYSTEM_CRON_FILE}"
+    echo "  Runs every ${interval} minutes as root"
+    echo ""
+    echo "Remove with: llama-reaper uninstall --system"
+}
+
+cmd_uninstall() {
+    local system=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --system)   system=true; shift ;;
+            --help|-h)  usage_uninstall ;;
+            *)          die "Unknown uninstall option: $1" ;;
+        esac
+    done
+
+    if [[ "${system}" == true ]]; then
+        uninstall_system
+    else
+        uninstall_user
+    fi
+}
+
+uninstall_user() {
+    local existing
+    existing="$(crontab -l 2>/dev/null || true)"
+
+    if ! echo "${existing}" | grep -q "${CRON_MARKER}"; then
+        echo "No llama-reaper cron entry found in user crontab."
+        return 0
+    fi
+
+    # Remove lines containing our marker
+    echo "${existing}" | grep -v "${CRON_MARKER}" | crontab -
+
+    echo "Removed llama-reaper from user crontab."
+}
+
+uninstall_system() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "System uninstall requires root. Re-running with sudo..."
+        exec sudo "${SCRIPT_PATH}" uninstall --system
+    fi
+
+    if [[ -f "${SYSTEM_CRON_FILE}" ]]; then
+        rm -f "${SYSTEM_CRON_FILE}"
+        echo "Removed ${SYSTEM_CRON_FILE}"
+    else
+        echo "No system cron file found at ${SYSTEM_CRON_FILE}"
+    fi
+}
+
+# ---------- Argument Parsing & Main ----------
+
+main() {
+    # Handle subcommands first
+    if [[ $# -gt 0 ]]; then
+        case "$1" in
+            list)
+                shift
+                # Check for --help in remaining args
+                for arg in "$@"; do
+                    [[ "${arg}" == "--help" || "${arg}" == "-h" ]] && usage_list
+                done
+                cmd_list "$@"
+                return 0
+                ;;
+            install)
+                shift
+                cmd_install "$@"
+                return 0
+                ;;
+            uninstall)
+                shift
+                cmd_uninstall "$@"
+                return 0
+                ;;
+        esac
+    fi
+
+    # Parse main options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --max-idle)
+                [[ -n "${2:-}" ]] || die "--max-idle requires a value"
+                MAX_IDLE_MINUTES="$2"
+                shift 2
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --force)
+                FORCE=true
+                shift
+                ;;
+            --system-run)
+                # Internal flag: used by system cron to enable system mode
+                SYSTEM_MODE=true
+                shift
+                ;;
+            --help|-h)
+                usage
+                ;;
+            --version)
+                echo "llama-reaper ${VERSION}"
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1. Try 'llama-reaper --help'."
+                ;;
+        esac
+    done
+
+    # Override state directories for system mode so cron (running as root)
+    # and user diagnostics don't collide on ${HOME}-based paths.
+    if [[ "${SYSTEM_MODE}" == true ]]; then
+        USER_STATE_DIR="/var/lib/llama-reaper"
+        REAPER_STATE_DIR="/var/lib/llama-reaper/reaper"
+    fi
+
+    reap
+}
+
+main "$@"
