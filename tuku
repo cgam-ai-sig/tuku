@@ -32,7 +32,7 @@ readonly CRON_MARKER="# tuku-managed"
 readonly SYSTEM_CRON_FILE="/etc/cron.d/tuku"
 
 # Llama process name patterns (extended regex for grep -E)
-readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama\.cpp'
+readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama[.]cpp'
 
 # Safety net: common non-llama executables to skip
 readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
@@ -127,11 +127,27 @@ get_process_uptime_seconds() {
 # In user mode (SYSTEM_MODE=false), filters to current user only.
 # Matches LLAMA_PATTERN against the executable basename only.
 find_llama_processes() {
-    local ps_output
-    ps_output="$(ps -eo pid=,user=,args= 2>/dev/null)" || return 0
-
     local current_user
     current_user="$(whoami)"
+
+    # Pre-filter: single awk pass extracts matching lines only
+    local filtered
+    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
+{
+    # Extract the executable basename from the command (first word of args)
+    cmd = $3
+    n = split(cmd, parts, "/")
+    exe = parts[n]
+
+    # Skip excluded basenames
+    if (match(exe, excluded)) next
+
+    # Match against llama pattern
+    if (match(exe, pattern)) print $0
+}
+')" || return 0
+
+    [[ -z "${filtered}" ]] && return 0
 
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
@@ -140,21 +156,6 @@ find_llama_processes() {
         pid="$(echo "${line}" | awk '{print $1}')"
         user="$(echo "${line}" | awk '{print $2}')"
         args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
-
-        # Extract executable basename
-        local exe_path exe_basename
-        exe_path="$(echo "${args}" | awk '{print $1}')"
-        exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
-
-        # Skip common non-llama executables
-        if echo "${exe_basename}" | grep -qE "^(${EXCLUDED_BASENAMES})$"; then
-            continue
-        fi
-
-        # Check if the executable basename matches a llama process pattern
-        if ! echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"; then
-            continue
-        fi
 
         # Skip ourselves
         [[ "${pid}" == "$$" ]] && continue
@@ -165,7 +166,7 @@ find_llama_processes() {
         fi
 
         echo "${pid} ${user} ${args}"
-    done <<< "${ps_output}"
+    done <<< "${filtered}"
 }
 
 # Get listen port for a process — try args first, then ss fallback
@@ -201,7 +202,7 @@ get_model_name() {
     # API fallback if no model from args and port is known
     if [[ -z "${model}" ]] && [[ -n "${port}" ]]; then
         local api_response
-        api_response="$(curl -s --max-time 1 "http://localhost:${port}/v1/models" 2>/dev/null)" || api_response=""
+        api_response="$(curl -s --connect-timeout 0.5 --max-time 1 "http://localhost:${port}/v1/models" 2>/dev/null)" || api_response=""
         if [[ -n "${api_response}" ]]; then
             model="$(printf '%s' "${api_response}" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)" || model=""
         fi
@@ -796,6 +797,7 @@ label_val() {
 GPU_INFO=""
 GPU_PROCS=""
 GPU_AVAILABLE=false
+declare -A GPU_VRAM_BY_PID
 
 cache_gpu_data() {
     if command -v nvidia-smi &>/dev/null; then
@@ -804,15 +806,26 @@ cache_gpu_data() {
         if [[ -n "${GPU_INFO}" ]]; then
             GPU_AVAILABLE=true
         fi
+        # Build associative array for O(1) VRAM lookups per PID
+        GPU_VRAM_BY_PID=()
+        if [[ -n "${GPU_PROCS}" ]]; then
+            while IFS= read -r _line; do
+                [[ -z "${_line}" ]] && continue
+                local _pid _mem
+                _pid="${_line%%,*}"
+                _mem="${_line#*,}"
+                _pid="${_pid#"${_pid%%[! ]*}"}"  # trim leading spaces
+                _mem="${_mem#"${_mem%%[! ]*}"}"  # trim leading spaces
+                _mem="${_mem%%[[:space:]]*}"     # trim trailing spaces
+                [[ -n "${_pid}" ]] && GPU_VRAM_BY_PID["${_pid}"]="${_mem}"
+            done <<< "${GPU_PROCS}"
+        fi
     fi
 }
 
 get_vram_for_pid() {
     local target_pid="$1"
-    [[ -z "${GPU_PROCS}" ]] && echo "" && return 0
-    local mem
-    mem="$(echo "${GPU_PROCS}" | sed 's/,/ /g; s/^[[:space:]]*//' | awk -v p="${target_pid}" '$1 == p {print $2; exit}')" || mem=""
-    echo "${mem}"
+    echo "${GPU_VRAM_BY_PID[${target_pid}]:-}"
 }
 
 GPU_NAME="" GPU_MEM_USED=0 GPU_MEM_TOTAL=0 GPU_TEMP=0
@@ -873,7 +886,7 @@ OLLAMA_MODELS_DISPLAY=()
 
 fetch_ollama() {
     local response
-    response="$(curl -s --max-time 2 http://localhost:11434/api/ps 2>/dev/null)" || response=""
+    response="$(curl -s --connect-timeout 0.5 --max-time 1 http://localhost:11434/api/ps 2>/dev/null)" || response=""
     if [[ -z "${response}" ]]; then
         OLLAMA_STATUS="down"
         return
@@ -1019,8 +1032,19 @@ DASH_LLAMA_STATUS_COLORS=()
 
 # Dashboard-specific process discovery (uses cached GPU data, API fallbacks)
 find_llama_for_dashboard() {
-    local ps_output
-    ps_output="$(ps -eo pid=,user=,args= 2>/dev/null)" || return 0
+    # Pre-filter: single awk pass extracts matching lines only
+    local filtered
+    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
+{
+    cmd = $3
+    n = split(cmd, parts, "/")
+    exe = parts[n]
+    if (match(exe, excluded)) next
+    if (match(exe, pattern)) print $0
+}
+')" || return 0
+
+    [[ -z "${filtered}" ]] && return 0
 
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
@@ -1030,16 +1054,6 @@ find_llama_for_dashboard() {
         user="$(echo "${line}" | awk '{print $2}')"
         args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
-        local exe_path exe_base
-        exe_path="$(echo "${args}" | awk '{print $1}')"
-        exe_base="$(basename "${exe_path}")"
-
-        if echo "${exe_base}" | grep -qE "^(${EXCLUDED_BASENAMES})$"; then
-            continue
-        fi
-        if ! echo "${exe_base}" | grep -qE "${LLAMA_PATTERN}"; then
-            continue
-        fi
         [[ "${pid}" == "$$" ]] && continue
 
         DASH_LLAMA_PIDS+=("${pid}")
@@ -1081,7 +1095,7 @@ find_llama_for_dashboard() {
         status_color="${status_result##*|}"
         DASH_LLAMA_STATUSES+=("${status_text}")
         DASH_LLAMA_STATUS_COLORS+=("${status_color}")
-    done <<< "${ps_output}"
+    done <<< "${filtered}"
 }
 
 render_llama() {
@@ -1311,8 +1325,17 @@ EOF
 }
 
 cmd_list() {
-    local ps_output
-    ps_output="$(ps -eo pid=,user=,args= 2>/dev/null)" || { echo "Failed to run ps"; exit 1; }
+    # Pre-filter: single awk pass extracts matching lines only
+    local filtered
+    filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
+{
+    cmd = $3
+    n = split(cmd, parts, "/")
+    exe = parts[n]
+    if (match(exe, excluded)) next
+    if (match(exe, pattern)) print $0
+}
+')" || { echo "Failed to run ps"; exit 1; }
 
     # Get GPU processes once (reap-style query for scoring)
     local gpu_procs
@@ -1329,6 +1352,11 @@ cmd_list() {
     local now
     now="$(date +%s)"
 
+    if [[ -z "${filtered}" ]]; then
+        echo "No llama.cpp processes found."
+        return 0
+    fi
+
     while IFS= read -r line; do
         [[ -z "${line}" ]] && continue
 
@@ -1337,16 +1365,6 @@ cmd_list() {
         user="$(echo "${line}" | awk '{print $2}')"
         args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
-        local exe_path exe_basename
-        exe_path="$(echo "${args}" | awk '{print $1}')"
-        exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
-
-        if echo "${exe_basename}" | grep -qE "^(${EXCLUDED_BASENAMES})$"; then
-            continue
-        fi
-        if ! echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"; then
-            continue
-        fi
         [[ "${pid}" == "$$" ]] && continue
 
         # GPU memory
@@ -1398,7 +1416,7 @@ cmd_list() {
         done
 
         entries+=("${pid}|${user}|${gpu_mem}|${port}|${uptime_str}|${score}|${model}|${last_active_str}")
-    done <<< "${ps_output}"
+    done <<< "${filtered}"
 
     if [[ ${#entries[@]} -eq 0 ]]; then
         echo "No llama.cpp processes found."
