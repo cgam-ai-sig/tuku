@@ -22,7 +22,7 @@ NO_COLOR=false
 
 usage() {
     cat <<'EOF'
-Usage: llama-status [--json] [--compact] [--no-color] [--help]
+Usage: llama-status [--json] [--compact] [--no-color] [--help|-h]
 
 GPU status dashboard with Ollama, llama.cpp, and reaper info.
 
@@ -30,7 +30,7 @@ Options:
   --json       Output all section data as JSON
   --compact    Single-line summary
   --no-color   Strip ANSI color codes (for piping)
-  --help       Show this help message
+  --help, -h   Show this help message
 EOF
     exit 0
 }

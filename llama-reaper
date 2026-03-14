@@ -72,7 +72,6 @@ Scoring System:
   No network connections (servers) .... +2
   Running > 2 hours ................... +1
   Running > 8 hours ................... +2
-  State file with expired timeout ..... +5
 
   Score >= 6: WARN (write marker, log warning)
   Score >= 8: KILL (if warned > 5min ago)
@@ -386,7 +385,7 @@ get_process_start_epoch() {
     echo "$(( boot_time + starttime / clk_tck ))"
 }
 
-# Get the port a process is listening on (for llama-server)
+# Get the port a process is listening on
 get_listen_port() {
     local pid="$1"
     # Use ss to find LISTEN sockets for this PID
@@ -412,18 +411,8 @@ get_model_name() {
     local pid="$1" cmdline="$2"
     local model=""
 
-    # Try state file first
-    local state_file="${USER_STATE_DIR}/${pid}.json"
-    if [[ -f "${state_file}" ]]; then
-        local data
-        data="$(cat "${state_file}" 2>/dev/null)" || true
-        model="$(json_str "model" "${data}")"
-    fi
-
-    # Fall back to parsing command line for -m or --model
-    if [[ -z "${model}" ]] || [[ "${model}" == "unknown" ]]; then
-        model="$(echo "${cmdline}" | grep -oP '(-m|--model)\s+\K\S+' | head -1)" || true
-    fi
+    # Parse command line for -m or --model
+    model="$(echo "${cmdline}" | grep -oP '(-m|--model)\s+\K\S+' | head -1)" || true
 
     if [[ -n "${model}" ]]; then
         basename "${model}" 2>/dev/null || echo "${model}"
@@ -449,38 +438,6 @@ load_cpu_sample() {
     if [[ -f "${sample_file}" ]]; then
         cat "${sample_file}" 2>/dev/null || true
     fi
-}
-
-# ---------- State File Timeout Check ----------
-
-# Check if a state file indicates the process should have timed out
-# Returns 0 (true) if expired, 1 (false) otherwise
-check_state_file_expired() {
-    local pid="$1"
-    local state_file="${USER_STATE_DIR}/${pid}.json"
-    [[ -f "${state_file}" ]] || return 1
-
-    local data
-    data="$(cat "${state_file}" 2>/dev/null)" || return 1
-
-    local start_epoch timeout_min
-    start_epoch="$(json_num "start_epoch" "${data}")"
-    timeout_min="$(json_num "timeout_minutes" "${data}")"
-
-    [[ "${start_epoch}" -gt 0 ]] || return 1
-    [[ "${timeout_min}" -gt 0 ]] || return 1
-
-    local now elapsed_min
-    now="$(date +%s)"
-    elapsed_min="$(( (now - start_epoch) / 60 ))"
-
-    # If process has been running longer than its configured timeout,
-    # the wrapper should have killed it — something went wrong
-    if [[ ${elapsed_min} -gt $(( timeout_min * 2 )) ]]; then
-        return 0
-    fi
-
-    return 1
 }
 
 # ---------- Idle Scoring ----------
@@ -574,13 +531,7 @@ calculate_idle_score() {
         reasons+=("not listening on any port (+0)")
     fi
 
-    # --- d. State file expired timeout ---
-    if check_state_file_expired "${pid}"; then
-        score=$((score + 5))
-        reasons+=("state file timeout expired (+5)")
-    fi
-
-    # --- e. Process age ---
+    # --- d. Process age ---
     local start_epoch
     start_epoch="$(get_process_start_epoch "${pid}" 2>/dev/null)" || start_epoch=0
     if [[ ${start_epoch} -gt 0 ]]; then
@@ -644,8 +595,7 @@ check_warn_marker_aged() {
 cleanup_pid_files() {
     local pid="$1"
     rm -f "${REAPER_STATE_DIR}/${pid}.warned" \
-          "${REAPER_STATE_DIR}/${pid}.cpu" \
-          "${USER_STATE_DIR}/${pid}.json" 2>/dev/null || true
+          "${REAPER_STATE_DIR}/${pid}.cpu" 2>/dev/null || true
 }
 
 # Kill a process: SIGTERM, wait 10s, SIGKILL if needed
