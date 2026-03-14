@@ -5,7 +5,7 @@ set -euo pipefail
 # Copies scripts to /usr/local/bin/ and optionally sets up the system reaper cron.
 
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly SCRIPTS=("tuku" "tuku-status")
+readonly SCRIPTS=("tuku")
 readonly INSTALL_DIR="/usr/local/bin"
 readonly STATE_DIR="/var/lib/tuku"
 
@@ -43,7 +43,7 @@ Uninstall Options:
   --purge         Also remove /var/lib/tuku/ state directory
 
 What it does:
-  1. Copies tuku, tuku-status to /usr/local/bin/
+  1. Copies tuku to /usr/local/bin/
   2. Sets ownership root:root, mode 0755
   3. Creates /var/lib/tuku/ for system-mode state
   4. Optionally installs system reaper cron (--with-reaper)
@@ -135,8 +135,11 @@ do_install() {
     info "Verify with: which tuku"
     echo ""
     info "Available commands:"
-    info "  tuku            — Watchdog for idle llama.cpp processes"
-    info "  tuku-status     — GPU status dashboard"
+    info "  tuku            — GPU dashboard (default)"
+    info "  tuku reap       — Run idle process detection and cleanup"
+    info "  tuku list       — Show all llama.cpp processes with diagnostics"
+    info "  tuku install    — Set up automatic reaping via cron"
+    info "  tuku kill <PID> — Manually kill a llama.cpp process"
     echo ""
 }
 
