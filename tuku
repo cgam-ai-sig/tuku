@@ -276,6 +276,11 @@ log_msg() {
 
 # ---------- GPU scoring (reap-specific) ----------
 
+# Get overall GPU power draw in watts (integer, rounded)
+get_gpu_power_draw() {
+    nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | awk '{printf "%d", $1+0.5}'
+}
+
 # Returns "PID GPU_MEM_MIB" per line
 get_gpu_processes() {
     nvidia-smi --query-compute-apps=pid,used_gpu_memory \
@@ -417,22 +422,38 @@ calculate_idle_score() {
     local now
     now="$(date +%s)"
 
+    # Get overall GPU power draw
+    local gpu_power
+    gpu_power=$(get_gpu_power_draw)
+    local gpu_power_active=false
+    if [[ "${gpu_power}" -gt 100 ]]; then
+        gpu_power_active=true
+    fi
+
     # --- a. GPU compute activity ---
     local gpu_mem
     gpu_mem="$(get_gpu_mem_for_pid "${pid}")"
     if [[ -z "${gpu_mem}" ]] || [[ "${gpu_mem}" == "0" ]]; then
-        score=$((score + 3))
-        reasons+=("no GPU memory (+3)")
-    else
-        local gpu_util_status
-        gpu_util_status="$(get_gpu_utilization_for_pid "${pid}")"
-        if [[ "${gpu_util_status}" == "active" ]]; then
-            reasons+=("GPU mem: ${gpu_mem}MiB, actively computing (+0)")
-        elif [[ "${gpu_util_status}" == "idle" ]]; then
-            score=$((score + 3))
-            reasons+=("GPU mem: ${gpu_mem}MiB, utilization 0% — holding memory idle (+3)")
+        if [[ "${gpu_power_active}" == true ]]; then
+            reasons+=("no GPU memory, but power ${gpu_power}W > 100W — GPU active (+0)")
         else
-            reasons+=("GPU mem: ${gpu_mem}MiB, utilization unknown (+0)")
+            score=$((score + 3))
+            reasons+=("no GPU memory, power ${gpu_power}W (+3)")
+        fi
+    else
+        if [[ "${gpu_power_active}" == true ]]; then
+            reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W > 100W — GPU active (+0)")
+        else
+            local gpu_util_status
+            gpu_util_status="$(get_gpu_utilization_for_pid "${pid}")"
+            if [[ "${gpu_util_status}" == "active" ]]; then
+                reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W, actively computing (+0)")
+            elif [[ "${gpu_util_status}" == "idle" ]]; then
+                score=$((score + 3))
+                reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W, utilization 0% — holding memory idle (+3)")
+            else
+                reasons+=("GPU mem: ${gpu_mem}MiB, power ${gpu_power}W, utilization unknown (+0)")
+            fi
         fi
     fi
 
@@ -591,11 +612,13 @@ Options:
 
 Scoring System:
   No GPU memory at all ................ +3
-  GPU memory held, utilization 0% ..... +3
+  GPU memory held, power <= 100W,
+    utilization 0% .................... +3
   No CPU time change since last run ... +3
   No network connections (servers) .... +2
   Running > 2 hours ................... +1
   Running > 8 hours ................... +2
+  GPU power > 100W .................... all GPU idle scoring blocked
 
   Score >= 8 and idle for >= --max-idle minutes: KILL
 
@@ -673,7 +696,9 @@ cmd_reap() {
         reason="$(echo "${score_result}" | cut -d' ' -f2-)"
 
         if [[ "${VERBOSE}" == true ]]; then
-            echo "  PID ${pid} (${user}, ${model}): score=${score}"
+            local gpu_power_display
+            gpu_power_display=$(get_gpu_power_draw)
+            echo "  PID ${pid} (${user}, ${model}): score=${score}  [GPU power: ${gpu_power_display}W]"
             echo "    ${reason}"
         fi
 
@@ -830,6 +855,7 @@ get_vram_for_pid() {
 
 GPU_NAME="" GPU_MEM_USED=0 GPU_MEM_TOTAL=0 GPU_TEMP=0
 GPU_POWER_DRAW=0 GPU_POWER_LIMIT=0 GPU_UTIL=0
+GPU_POWER_ACTIVE=false
 
 parse_gpu_info() {
     [[ "${GPU_AVAILABLE}" != true ]] && return 1
@@ -841,6 +867,11 @@ parse_gpu_info() {
     GPU_POWER_DRAW="$(echo "${_pow_draw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -d. -f1)"
     GPU_POWER_LIMIT="$(echo "${_pow_limit}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -d. -f1)"
     GPU_UTIL="$(echo "${_util}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -d. -f1)"
+    if [[ ${GPU_POWER_DRAW} -gt 100 ]]; then
+        GPU_POWER_ACTIVE=true
+    else
+        GPU_POWER_ACTIVE=false
+    fi
     return 0
 }
 
@@ -987,6 +1018,12 @@ get_reaper_status_for_pid() {
     if [[ ${process_age_minutes} -lt ${min_age} ]]; then
         local remaining=$(( min_age - process_age_minutes ))
         echo "safe ${remaining}m|green"
+        return
+    fi
+
+    # If GPU power > 100W, treat as active regardless
+    if [[ "${GPU_POWER_ACTIVE}" == true ]]; then
+        echo "active|green"
         return
     fi
 
@@ -1165,7 +1202,7 @@ render_reaper() {
     print_header "Reaper"
     if [[ "${REAPER_STATUS}" == "active" ]]; then
         local detail=""
-        local interval="${REAPER_INTERVAL:-5}"
+        local interval="${REAPER_INTERVAL:-1}"
         local min_age="${REAPER_MIN_AGE:-60}"
         local max_idle="${REAPER_MAX_IDLE:-30}"
         detail=" (every ${interval}m, min-age ${min_age}m, max-idle ${max_idle}m)"
@@ -1231,7 +1268,7 @@ render_json() {
     printf '  "reaper": {\n'
     printf '    "status": "%s"' "${REAPER_STATUS}"
     if [[ "${REAPER_STATUS}" == "active" ]]; then
-        printf ',\n    "interval_minutes": "%s"' "${REAPER_INTERVAL:-5}"
+        printf ',\n    "interval_minutes": "%s"' "${REAPER_INTERVAL:-1}"
         printf ',\n    "min_age_minutes": "%s"' "${REAPER_MIN_AGE:-60}"
         printf ',\n    "max_idle_minutes": "%s"' "${REAPER_MAX_IDLE:-30}"
     fi
@@ -1292,6 +1329,7 @@ cmd_dashboard() {
 
     # Gather all data upfront
     cache_gpu_data
+    parse_gpu_info 2>/dev/null || true
     fetch_ollama
     find_llama_for_dashboard
     fetch_reaper
@@ -1451,7 +1489,7 @@ Install tuku as a recurring cron job.
 Options:
   --system             Install system-wide (requires sudo). Creates
                        /etc/cron.d/tuku running as root.
-  --interval MINUTES   How often the reaper runs (default: 5)
+  --interval MINUTES   How often the reaper runs (default: 1)
   --min-age MINUTES    Minimum process age for reaping eligibility (default: 60).
                        Passed through to the cron entry.
   --max-idle MINUTES   Continuous idle duration before killing (default: 30).
@@ -1578,7 +1616,7 @@ uninstall_system() {
 
 cmd_install() {
     local system=false
-    local interval=5
+    local interval=1
     local min_age=""
     local max_idle=""
 

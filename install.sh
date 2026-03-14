@@ -36,7 +36,7 @@ Commands:
   uninstall       Remove scripts and optionally purge state
 
 Install Options:
-  --with-reaper   Also install the system reaper cron (every 5m, min-age 60m, max-idle 30m)
+  --with-reaper   Also install the system reaper cron (every 1m, min-age 60m, max-idle 30m)
   --help, -h      Show this help message
 
 Uninstall Options:
@@ -122,8 +122,8 @@ do_install() {
     if [[ "${with_reaper}" == true ]]; then
         echo ""
         printf "${BOLD}Installing system reaper cron...${RESET}\n"
-        "${INSTALL_DIR}/tuku" install --system --interval 5 --min-age 60 --max-idle 30
-        check "System reaper cron installed (every 5m, min-age 60m, max-idle 30m)"
+        "${INSTALL_DIR}/tuku" install --system --interval 1 --min-age 60 --max-idle 30
+        check "System reaper cron installed (every 1m, min-age 60m, max-idle 30m)"
         info "Customize with: tuku install --help"
     fi
 
