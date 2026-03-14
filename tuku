@@ -59,6 +59,9 @@ die() {
 
 ensure_dirs() {
     mkdir -p "${REAPER_STATE_DIR}"
+    if [[ "${SYSTEM_MODE}" == true ]]; then
+        chmod 755 "${REAPER_STATE_DIR}" 2>/dev/null || true
+    fi
 }
 
 # Get CLK_TCK for proc stat calculations (cached)
@@ -371,6 +374,7 @@ save_cpu_sample() {
     local pid="$1" cpu_time="$2"
     local sample_file="${REAPER_STATE_DIR}/${pid}.cpu"
     echo "$(date +%s) ${cpu_time}" > "${sample_file}"
+    chmod 644 "${sample_file}" 2>/dev/null || true
 }
 
 load_cpu_sample() {
@@ -399,6 +403,7 @@ write_alive_timestamp() {
     local pid="$1"
     local alive_file="${REAPER_STATE_DIR}/${pid}.alive"
     date +%s > "${alive_file}"
+    chmod 644 "${alive_file}" 2>/dev/null || true
 }
 
 read_alive_timestamp() {
@@ -756,6 +761,7 @@ CYAN='\033[0;36m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
+DIM_GRAY='\033[90m'
 RESET='\033[0m'
 USE_COLOR=true
 
@@ -767,20 +773,20 @@ c() {
 
 # ---------- Display helpers ----------
 
-# Section header: ━━━ Title ━━━━━━━━━━━━━━━━━━━━━━━
+# Section header: ─── Title ─────────────────────────
 print_header() {
     local title="$1"
     local total_width=49
-    local pre_len=4  # "━━━ " is 4 chars visually
+    local pre_len=4  # "─── " is 4 chars visually
     local title_len=${#title}
     local space=1
     local fill_len=$(( total_width - pre_len - title_len - space ))
     [[ ${fill_len} -lt 1 ]] && fill_len=1
     local fill=""
     for ((i = 0; i < fill_len; i++)); do
-        fill+="━"
+        fill+="─"
     done
-    printf '%b━━━ %s %s%b\n' "${BOLD_WHITE}" "${title}" "${fill}" "${RESET}"
+    printf '%b─── %s %s%b\n' "${DIM_GRAY}" "${title}" "${fill}" "${RESET}"
 }
 
 # Progress bar: current, max, width → ━━━━━━━─── XX%
@@ -1032,11 +1038,11 @@ get_reaper_status_for_pid() {
     local system_alive="/var/lib/tuku/reaper/${pid}.alive"
     local user_alive="${HOME}/.local/state/tuku/reaper/${pid}.alive"
 
-    # Check system mode first, then user mode
-    if [[ -f "${system_alive}" ]]; then
+    # Check system mode first, then user mode (handle permission denied gracefully)
+    if [[ -f "${system_alive}" ]] && [[ -r "${system_alive}" ]]; then
         alive_ts="$(cat "${system_alive}" 2>/dev/null)" || alive_ts=""
     fi
-    if [[ -z "${alive_ts}" ]] && [[ -f "${user_alive}" ]]; then
+    if [[ -z "${alive_ts}" ]] && [[ -f "${user_alive}" ]] && [[ -r "${user_alive}" ]]; then
         alive_ts="$(cat "${user_alive}" 2>/dev/null)" || alive_ts=""
     fi
 
@@ -1323,6 +1329,7 @@ cmd_dashboard() {
         GREEN=''
         YELLOW=''
         RED=''
+        DIM_GRAY=''
         RESET=''
         USE_COLOR=false
     fi
@@ -1331,8 +1338,8 @@ cmd_dashboard() {
     cache_gpu_data
     parse_gpu_info 2>/dev/null || true
     fetch_ollama
+    fetch_reaper                    # Must populate REAPER_STATUS before find_llama_for_dashboard
     find_llama_for_dashboard
-    fetch_reaper
 
     case "${output_mode}" in
         json)    render_json ;;

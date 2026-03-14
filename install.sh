@@ -103,13 +103,15 @@ do_install() {
         check "${script} → ${dst}"
     done
 
-    # 2. Create system state directory
+    # 2. Create system state directory (world-readable so non-root users can read .alive files)
     if [[ ! -d "${STATE_DIR}" ]]; then
         mkdir -p "${STATE_DIR}"
         check "Created ${STATE_DIR}/"
     else
         check "${STATE_DIR}/ already exists"
     fi
+    chmod 755 "${STATE_DIR}/"
+    chmod 755 "${STATE_DIR}/reaper/" 2>/dev/null || true
 
     # 3. Verify /var/log/ exists (it always should)
     if [[ -d /var/log ]]; then
