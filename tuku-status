@@ -67,27 +67,6 @@ c() {
 }
 
 # Section header: ━━━ Title ━━━━━━━━━━━━━━━━━━━━━━━
-section_header() {
-    local title="$1"
-    local total_width=49
-    local prefix="━━━ "
-    local suffix_char="━"
-    local prefix_len=${#prefix}
-    local title_len=${#title}
-    local space_after=" "
-    local used=$(( prefix_len + title_len + 1 ))
-    local remaining=$(( total_width - used ))
-    [[ ${remaining} -lt 1 ]] && remaining=1
-    local suffix=""
-    for ((i = 0; i < remaining; i++)); do
-        suffix+="${suffix_char}"
-    done
-    printf '%b%s%b%s%s%b\n' "${BOLD_WHITE}" "${prefix}" "${CYAN}" "${title}" "${space_after}" "${RESET}"
-    # Actually print the full line with fill
-    :
-}
-
-# Better section header that matches spec exactly
 print_header() {
     local title="$1"
     local total_width=49
@@ -144,18 +123,6 @@ format_uptime() {
     else
         printf '%dd %dh' "$((seconds / 86400))" "$(((seconds % 86400) / 3600))"
     fi
-}
-
-# Extract a string value from minimal JSON (no jq)
-json_str() {
-    local key="$1" data="$2"
-    printf '%s' "${data}" | sed -n 's/.*"'"${key}"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
-}
-
-# Extract a numeric value from minimal JSON
-json_num() {
-    local key="$1" data="$2"
-    printf '%s' "${data}" | sed -n 's/.*"'"${key}"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1
 }
 
 # Convert MiB to a clean GB string
@@ -261,7 +228,7 @@ get_process_start_epoch() {
 get_process_uptime_seconds() {
     local pid="$1"
     local start_epoch
-    start_epoch="$(get_process_start_epoch "${pid}" 2>/dev/null)" || echo "0"
+    start_epoch="$(get_process_start_epoch "${pid}" 2>/dev/null)" || start_epoch=0
     if [[ -n "${start_epoch}" ]] && [[ "${start_epoch}" -gt 0 ]]; then
         echo "$(( $(date +%s) - start_epoch ))"
     else
@@ -422,6 +389,9 @@ render_ollama() {
 # Llama process pattern (same as reaper)
 readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama\.cpp'
 
+# Safety net: never match these commands even if their path contains a pattern token
+readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
+
 # Arrays for llama.cpp process data
 LLAMA_PIDS=()
 LLAMA_USERS=()
@@ -445,7 +415,17 @@ find_llama_processes() {
         user="$(echo "${line}" | awk '{print $2}')"
         args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
-        if ! echo "${args}" | grep -qE "${LLAMA_PATTERN}"; then
+        # Match LLAMA_PATTERN against the executable basename, not the full args
+        local exe_path exe_base
+        exe_path="$(echo "${args}" | awk '{print $1}')"
+        exe_base="$(basename "${exe_path}")"
+
+        # Skip common tools that might appear in a grep/editor command line
+        if echo "${exe_base}" | grep -qE "^(${EXCLUDED_BASENAMES})$"; then
+            continue
+        fi
+
+        if ! echo "${exe_base}" | grep -qE "${LLAMA_PATTERN}"; then
             continue
         fi
 

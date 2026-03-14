@@ -224,22 +224,14 @@ format_uptime() {
     fi
 }
 
-# Extract a string value from minimal JSON (avoids jq dependency)
-json_str() {
-    local key="$1" data="$2"
-    printf '%s' "${data}" | grep -oP "\"${key}\"\s*:\s*\"\K[^\"]*" 2>/dev/null || echo ""
-}
-
-# Extract a numeric value from minimal JSON
-json_num() {
-    local key="$1" data="$2"
-    printf '%s' "${data}" | grep -oP "\"${key}\"\s*:\s*\K[0-9]+" 2>/dev/null || echo "0"
-}
-
 # ---------- Process Discovery ----------
+
+# Exclusion list: common non-llama executables that might appear in args
+readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
 
 # Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
 # In user mode, filters to current user only.
+# Matches LLAMA_PATTERN against the executable basename only, not full args.
 find_llama_processes() {
     local ps_output
     # Use ps to get PID, USER, full command — works without sudo
@@ -258,8 +250,18 @@ find_llama_processes() {
         user="$(echo "${line}" | awk '{print $2}')"
         args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
-        # Check if this is a llama process
-        if ! echo "${args}" | grep -qE "${LLAMA_PATTERN}"; then
+        # Extract executable basename from the first word of args
+        local exe_path exe_basename
+        exe_path="$(echo "${args}" | awk '{print $1}')"
+        exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
+
+        # Safety net: skip common non-llama executables
+        if echo "${exe_basename}" | grep -qE "^(${EXCLUDED_BASENAMES})$"; then
+            continue
+        fi
+
+        # Check if the executable basename matches a llama process pattern
+        if ! echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"; then
             continue
         fi
 
@@ -408,7 +410,7 @@ get_listen_port() {
     # Use ss to find LISTEN sockets for this PID
     local port
     port="$(ss -tlnp 2>/dev/null | grep "pid=${pid}[,)]" | \
-        grep -oP ':\K[0-9]+(?=\s)' | head -1)" || true
+        sed -n 's/.*:\([0-9]\{1,\}\)[[:space:]].*/\1/p' | head -1)" || true
     echo "${port}"
 }
 
@@ -429,7 +431,7 @@ get_model_name() {
     local model=""
 
     # Parse command line for -m or --model
-    model="$(echo "${cmdline}" | grep -oP '(-m|--model)\s+\K\S+' | head -1)" || true
+    model="$(echo "${cmdline}" | sed -n 's/.*\(-m\|--model\)[[:space:]]\{1,\}\(\S\{1,\}\).*/\2/p' | head -1)" || true
 
     if [[ -n "${model}" ]]; then
         basename "${model}" 2>/dev/null || echo "${model}"
@@ -479,9 +481,11 @@ read_alive_timestamp() {
 
 # Calculate idle score for a process.
 # Prints "SCORE reason1; reason2; ..."
-# Also saves CPU sample for next run.
+# When readonly=false (default), saves CPU sample for next run.
+# When readonly=true, skips writing CPU samples and alive timestamps.
 calculate_idle_score() {
     local pid="$1" user="$2" cmdline="$3"
+    local is_readonly="${4:-false}"
     local score=0
     local reasons=()
     local now
@@ -543,8 +547,10 @@ calculate_idle_score() {
             reasons+=("no previous CPU sample, first run (+0)")
         fi
 
-        # Save current sample for next run
-        save_cpu_sample "${pid}" "${current_cpu}"
+        # Save current sample for next run (skip in readonly mode)
+        if [[ "${is_readonly}" != true ]]; then
+            save_cpu_sample "${pid}" "${current_cpu}"
+        fi
     else
         reasons+=("cannot read CPU time (+0)")
     fi
@@ -785,7 +791,18 @@ cmd_list() {
         user="$(echo "${line}" | awk '{print $2}')"
         args="$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
 
-        if ! echo "${args}" | grep -qE "${LLAMA_PATTERN}"; then
+        # Extract executable basename from the first word of args
+        local exe_path exe_basename
+        exe_path="$(echo "${args}" | awk '{print $1}')"
+        exe_basename="$(basename "${exe_path}" 2>/dev/null)" || exe_basename="${exe_path}"
+
+        # Safety net: skip common non-llama executables
+        if echo "${exe_basename}" | grep -qE "^(${EXCLUDED_BASENAMES})$"; then
+            continue
+        fi
+
+        # Match LLAMA_PATTERN against basename only
+        if ! echo "${exe_basename}" | grep -qE "${LLAMA_PATTERN}"; then
             continue
         fi
 
@@ -817,10 +834,10 @@ cmd_list() {
         local model
         model="$(get_model_name "${pid}" "${args}")"
 
-        # Idle score (quick calculation — ensure dirs exist)
+        # Idle score (quick calculation — ensure dirs exist, readonly mode)
         ensure_dirs
         local score_result score
-        score_result="$(calculate_idle_score "${pid}" "${user}" "${args}")"
+        score_result="$(calculate_idle_score "${pid}" "${user}" "${args}" true)"
         score="$(echo "${score_result}" | awk '{print $1}')"
 
         # Check for .alive files in ALL state dirs — show last active time
