@@ -1015,7 +1015,7 @@ get_reaper_status_for_pid() {
 
     # No .alive file or unreadable — reaper hasn't assessed yet, benefit of doubt
     if [[ -z "${alive_ts}" ]] || ! [[ "${alive_ts}" =~ ^[0-9]+$ ]]; then
-        echo "inactive|green"
+        echo "inactive|dim"
         return
     fi
 
@@ -1034,7 +1034,7 @@ get_reaper_status_for_pid() {
     local remaining=$(( max_idle - idle_minutes ))
 
     if [[ ${remaining} -gt 5 ]]; then
-        echo "inactive|green"
+        echo "inactive|dim"
     elif [[ ${remaining} -gt 0 ]]; then
         echo "stale ${remaining}m|red"
     else
