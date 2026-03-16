@@ -126,6 +126,17 @@ get_process_uptime_seconds() {
     fi
 }
 
+# Escape a string for safe inclusion in a JSON value.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
 # Find all llama.cpp processes. Returns lines of "PID USER COMMAND"
 # In user mode (SYSTEM_MODE=false), filters to current user only.
 # Matches LLAMA_PATTERN against the executable basename only.
@@ -1340,17 +1351,61 @@ cmd_dashboard() {
 
 usage_list() {
     cat <<'EOF'
-Usage: tuku list
+Usage: tuku list [OPTIONS]
 
 Show all llama.cpp processes on the system with diagnostic info.
 
 Displays: PID, user, GPU memory, port, uptime, idle score, and last active time.
 This is read-only — no sudo needed (uses ps and nvidia-smi).
+
+Options:
+  --json       Output as JSON
+  --help, -h   Show this help
 EOF
     exit 0
 }
 
+render_list_json() {
+    local -n _entries=$1
+
+    printf '{\n'
+    printf '  "process_count": %s,\n' "${#_entries[@]}"
+    printf '  "processes": [\n'
+
+    if [[ ${#_entries[@]} -gt 0 ]]; then
+        for i in "${!_entries[@]}"; do
+            local comma=","
+            [[ $i -eq $(( ${#_entries[@]} - 1 )) ]] && comma=""
+
+            IFS='|' read -r pid user gpu_mem port uptime score model last_active <<< "${_entries[$i]}"
+
+            printf '    {"pid": %s, "user": "%s", "gpu_mem": "%s", "port": "%s", "uptime": "%s", "score": "%s", "last_active": "%s", "model": "%s"}%s\n' \
+                "${pid}" \
+                "$(json_escape "${user}")" \
+                "$(json_escape "${gpu_mem}")" \
+                "$(json_escape "${port}")" \
+                "$(json_escape "${uptime}")" \
+                "$(json_escape "${score}")" \
+                "$(json_escape "${last_active}")" \
+                "$(json_escape "${model}")" \
+                "${comma}"
+        done
+    fi
+
+    printf '  ]\n'
+    printf '}\n'
+}
+
 cmd_list() {
+    local output_mode="default"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)    output_mode="json"; shift ;;
+            --help|-h) usage_list ;;
+            *)         die "Unknown list option: $1. Run 'tuku list --help'." ;;
+        esac
+    done
+
     # Pre-filter: single awk pass extracts matching lines only
     local filtered
     filtered="$(ps -eo pid=,user=,args= 2>/dev/null | awk -v pattern="${LLAMA_PATTERN}" -v excluded="${EXCLUDED_BASENAMES}" '
@@ -1379,7 +1434,11 @@ cmd_list() {
     now="$(date +%s)"
 
     if [[ -z "${filtered}" ]]; then
-        echo "No llama.cpp processes found."
+        if [[ "${output_mode}" == "json" ]]; then
+            printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
+        else
+            echo "No llama.cpp processes found."
+        fi
         return 0
     fi
 
@@ -1445,7 +1504,16 @@ cmd_list() {
     done <<< "${filtered}"
 
     if [[ ${#entries[@]} -eq 0 ]]; then
-        echo "No llama.cpp processes found."
+        if [[ "${output_mode}" == "json" ]]; then
+            printf '{\n  "process_count": 0,\n  "processes": []\n}\n'
+        else
+            echo "No llama.cpp processes found."
+        fi
+        return 0
+    fi
+
+    if [[ "${output_mode}" == "json" ]]; then
+        render_list_json entries
         return 0
     fi
 
@@ -1779,6 +1847,9 @@ Dashboard Options:
   --compact    Single-line summary
   --no-color   Strip ANSI colors
 
+List Options:
+  --json       Output as JSON
+
 Run 'tuku <command> --help' for command-specific options.
 EOF
     exit 0
@@ -1787,13 +1858,7 @@ EOF
 main() {
     case "${1:-}" in
         reap)      shift; cmd_reap "$@" ;;
-        list)
-            shift
-            for arg in "$@"; do
-                [[ "${arg}" == "--help" || "${arg}" == "-h" ]] && usage_list
-            done
-            cmd_list "$@"
-            ;;
+        list)      shift; cmd_list "$@" ;;
         install)   shift; cmd_install "$@" ;;
         uninstall) shift; cmd_uninstall "$@" ;;
         kill)      shift; cmd_kill "$@" ;;
