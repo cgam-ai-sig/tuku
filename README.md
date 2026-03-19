@@ -1,6 +1,6 @@
 # tuku
 
-GPU cleanup tools for shared servers running llama.cpp. Automatically detects and kills idle `llama-server` / `llama-cli` processes that are blocking the GPU.
+GPU process management for shared servers running llama.cpp and other GPU workloads. Automatically detects and kills idle `llama-server` / `llama-cli` processes that are blocking the GPU.
 
 Solves the "someone forgot to stop their llama-server and now nobody else can use the GPU" problem. Ollama handles this with automatic model unloading — llama.cpp doesn't, so we built this.
 
@@ -18,7 +18,7 @@ Solves the "someone forgot to stop their llama-server and now nobody else can us
 | `tuku install` | Set up automatic reaping via cron |
 | `tuku uninstall` | Remove the cron job |
 
-Ollama processes are **never** targeted. Only `llama-server`, `llama-cli`, and `llama-cpp` processes are eligible for reaping.
+Ollama processes are **never** reaped automatically. The `kill` command also protects Ollama by default — use `tuku kill --force <PID>` to override.
 
 ## Quick start
 
@@ -109,6 +109,8 @@ tuku list --json               # machine-readable JSON output
 tuku reap --force              # skip --max-idle duration check, kill immediately if score >= 8
 tuku gpu                       # show all GPU processes
 tuku gpu --json                # machine-readable JSON output of all GPU processes
+tuku kill 12345                # kill a GPU process (Ollama protected)
+tuku kill --force 12345        # force kill (bypasses Ollama protection)
 ```
 
 ## Dashboard
@@ -139,11 +141,15 @@ Example output (`--no-color`):
   185334   alice    8 GB     http://localhost:8080/    2h 14m  ● idle 12m    Qwen2.5-Coder-32B-Q4_K_M.gguf
   191207   bob      5 GB     http://localhost:9090/    45m     ● protected   mistral-7b-v0.3.Q5_K_M.gguf
 
+━━━ Other GPU Processes ━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PID      USER         GPU_MEM    COMMAND                                    UPTIME
+  8421     alice        4812 MiB   python docling_extract.py --input /da...   3h 22m
+
 ━━━ Reaper ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Status   ● active (every 1m, min-age 60m, max-idle 30m)
 ```
 
-Shows GPU stats, Ollama status with loaded models and TTL, all llama.cpp processes with user/PID/VRAM/endpoint/uptime/reaper status/model, and whether the reaper is installed.
+Shows GPU stats, Ollama status with loaded models and TTL, all llama.cpp processes with user/PID/VRAM/endpoint/uptime/reaper status/model, other GPU processes (non-llama, non-Ollama), and whether the reaper is installed.
 
 ## Uninstall
 

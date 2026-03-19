@@ -141,7 +141,8 @@ do_install() {
     info "  tuku reap       — Run idle process detection and cleanup"
     info "  tuku list       — Show all llama.cpp processes with diagnostics"
     info "  tuku install    — Set up automatic reaping via cron"
-    info "  tuku kill <PID> — Manually kill a llama.cpp process"
+    info "  tuku kill <PID> — Manually kill a GPU process"
+    info "  tuku gpu        — Show all processes using the GPU"
     echo ""
 }
 

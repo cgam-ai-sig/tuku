@@ -2258,7 +2258,7 @@ usage() {
     cat <<'EOF'
 Usage: tuku [COMMAND] [OPTIONS]
 
-GPU process management for shared servers running llama.cpp.
+GPU process management for shared servers.
 
 Commands:
   (default)    Show GPU status dashboard
@@ -2267,7 +2267,7 @@ Commands:
   install      Set up automatic reaping via cron
   uninstall    Remove the cron job
   kill <PID>   Manually kill a GPU process
-  gpu            Show all processes using the GPU
+  gpu          Show all processes using the GPU
 
 Dashboard Options:
   --json       Output as JSON
@@ -2278,6 +2278,9 @@ Reap Options:
   --json       Output as JSON
 
 List Options:
+  --json       Output as JSON
+
+Gpu Options:
   --json       Output as JSON
 
 Run 'tuku <command> --help' for command-specific options.
