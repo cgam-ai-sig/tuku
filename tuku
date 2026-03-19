@@ -1213,6 +1213,83 @@ find_llama_for_dashboard() {
     done <<< "${process_lines}"
 }
 
+# ── Find non-llama, non-ollama GPU processes for dashboard ───────────
+
+DASH_OTHER_PIDS=()
+DASH_OTHER_USERS=()
+DASH_OTHER_VRAMS=()
+DASH_OTHER_CMDS=()
+DASH_OTHER_UPTIMES=()
+
+find_other_gpu_for_dashboard() {
+    # Reset arrays
+    DASH_OTHER_PIDS=()
+    DASH_OTHER_USERS=()
+    DASH_OTHER_VRAMS=()
+    DASH_OTHER_CMDS=()
+    DASH_OTHER_UPTIMES=()
+
+    # Need GPU_VRAM_BY_PID from cache_gpu_data
+    [[ ${#GPU_VRAM_BY_PID[@]} -eq 0 ]] && return 0
+
+    local pid
+    for pid in "${!GPU_VRAM_BY_PID[@]}"; do
+        # Skip if already shown in llama.cpp section
+        local is_llama_pid=false
+        local lp
+        for lp in "${DASH_LLAMA_PIDS[@]}"; do
+            if [[ "${lp}" == "${pid}" ]]; then
+                is_llama_pid=true
+                break
+            fi
+        done
+        [[ "${is_llama_pid}" == true ]] && continue
+
+        # Skip if process no longer exists
+        kill -0 "${pid}" 2>/dev/null || continue
+
+        # Get process info
+        local ps_info
+        ps_info="$(ps -p "${pid}" -o user=,etimes=,args= 2>/dev/null)" || continue
+        [[ -z "${ps_info}" ]] && continue
+
+        local user elapsed_secs cmdline
+        user="$(echo "${ps_info}" | awk '{print $1}')"
+        elapsed_secs="$(echo "${ps_info}" | awk '{print $2}')"
+        cmdline="$(echo "${ps_info}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}')"
+
+        # Classify — skip ollama
+        local exe_basename
+        exe_basename="$(echo "${cmdline}" | awk '{n=split($1,a,"/"); print a[n]}')"
+        if is_ollama_process "${exe_basename}"; then
+            continue
+        fi
+
+        DASH_OTHER_PIDS+=("${pid}")
+        DASH_OTHER_USERS+=("${user}")
+
+        local vram="${GPU_VRAM_BY_PID[${pid}]}"
+        if [[ -n "${vram}" ]] && [[ "${vram}" != "0" ]]; then
+            DASH_OTHER_VRAMS+=("$(mib_to_gb "${vram}")")
+        else
+            DASH_OTHER_VRAMS+=("-")
+        fi
+
+        # Truncate command
+        local cmd_display="${cmdline}"
+        if [[ ${#cmd_display} -gt 50 ]]; then
+            cmd_display="${cmd_display:0:47}..."
+        fi
+        DASH_OTHER_CMDS+=("${cmd_display}")
+
+        if [[ ${elapsed_secs} -gt 0 ]]; then
+            DASH_OTHER_UPTIMES+=("$(format_uptime "${elapsed_secs}")")
+        else
+            DASH_OTHER_UPTIMES+=("-")
+        fi
+    done
+}
+
 render_llama() {
     print_header "llama.cpp"
     if [[ ${#DASH_LLAMA_PIDS[@]} -eq 0 ]]; then
@@ -1275,6 +1352,25 @@ fetch_reaper() {
     fi
 
     REAPER_STATUS="not installed"
+}
+
+render_other_gpu() {
+    [[ ${#DASH_OTHER_PIDS[@]} -eq 0 ]] && return 0
+
+    print_header "Other GPU Processes"
+    printf "  ${BOLD_WHITE}%-8s %-12s %-10s %-52s %s${RESET}\n" \
+        "PID" "USER" "GPU_MEM" "COMMAND" "UPTIME"
+
+    local i
+    for ((i = 0; i < ${#DASH_OTHER_PIDS[@]}; i++)); do
+        printf "  %-8s %-12s %-10s %-52s %s\n" \
+            "${DASH_OTHER_PIDS[$i]}" \
+            "${DASH_OTHER_USERS[$i]}" \
+            "${DASH_OTHER_VRAMS[$i]}" \
+            "${DASH_OTHER_CMDS[$i]}" \
+            "${DASH_OTHER_UPTIMES[$i]}"
+    done
+    printf "\n"
 }
 
 render_reaper() {
@@ -1344,6 +1440,27 @@ render_json() {
     printf '    ]\n'
     printf '  },\n'
 
+    printf '    "other_gpu": {\n'
+    printf '      "process_count": %d,\n' "${#DASH_OTHER_PIDS[@]}"
+    printf '      "processes": ['
+    if [[ ${#DASH_OTHER_PIDS[@]} -gt 0 ]]; then
+        printf '\n'
+        for ((i = 0; i < ${#DASH_OTHER_PIDS[@]}; i++)); do
+            printf '        {\n'
+            printf '          "pid": %s,\n' "${DASH_OTHER_PIDS[$i]}"
+            printf '          "user": "%s",\n' "$(json_escape "${DASH_OTHER_USERS[$i]}")"
+            printf '          "gpu_mem": "%s",\n' "$(json_escape "${DASH_OTHER_VRAMS[$i]}")"
+            printf '          "command": "%s",\n' "$(json_escape "${DASH_OTHER_CMDS[$i]}")"
+            printf '          "uptime": "%s"\n' "$(json_escape "${DASH_OTHER_UPTIMES[$i]}")"
+            printf '        }'
+            [[ $((i + 1)) -lt ${#DASH_OTHER_PIDS[@]} ]] && printf ','
+            printf '\n'
+        done
+        printf '      '
+    fi
+    printf ']\n'
+    printf '    },\n'
+
     printf '  "reaper": {\n'
     printf '    "status": "%s"' "${REAPER_STATUS}"
     if [[ "${REAPER_STATUS}" == "active" ]]; then
@@ -1377,8 +1494,8 @@ render_compact() {
 
     local llama_str="${#DASH_LLAMA_PIDS[@]} processes"
 
-    printf 'GPU: %s | VRAM: %s | Ollama: %s | llama.cpp: %s\n' \
-        "${gpu_str}" "${vram_str}" "${ollama_str}" "${llama_str}"
+    printf 'GPU: %s | VRAM: %s | Ollama: %s | llama.cpp: %s | Other: %d\n' \
+        "${gpu_str}" "${vram_str}" "${ollama_str}" "${llama_str}" "${#DASH_OTHER_PIDS[@]}"
 }
 
 # ---------- cmd_dashboard() ----------
@@ -1413,6 +1530,7 @@ cmd_dashboard() {
     fetch_ollama
     fetch_reaper                    # Must populate REAPER_STATUS before find_llama_for_dashboard
     find_llama_for_dashboard
+    find_other_gpu_for_dashboard
 
     case "${output_mode}" in
         json)    render_json ;;
@@ -1421,6 +1539,7 @@ cmd_dashboard() {
             render_gpu
             render_ollama
             render_llama
+            render_other_gpu
             render_reaper
             ;;
     esac
