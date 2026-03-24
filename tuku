@@ -35,11 +35,19 @@ readonly SYSTEM_CRON_FILE="/etc/cron.d/tuku"
 readonly LLAMA_PATTERN='llama-server|llama-cli|llama-cpp|llama[.]cpp'
 readonly OLLAMA_PATTERN='ollama'                    # Ollama — protected from reap/kill
 
+# Operational modes
+readonly TUKU_MODE_AUTO="auto"
+readonly TUKU_MODE_OLLAMA_FIRST="ollama-first"
+readonly TUKU_MODE_LLAMA_CPP_ONLY="llama-cpp-only"
+
+# Current default (backward compatible)
+TUKU_MODE="${TUKU_MODE:-auto}"
+
 # Safety net: common non-llama executables to skip
 readonly EXCLUDED_BASENAMES='grep|vim|less|tail|cat|python|bash|sh|editor|nano|emacs'
 
-# Scoring threshold
-readonly SCORE_KILL=8
+# Scoring threshold (can be overridden by mode)
+SCORE_KILL=8
 
 # Reap defaults
 MIN_AGE_MINUTES=60
@@ -81,6 +89,19 @@ get_boot_time() {
         _BOOT_TIME="$(awk '/^btime / {print $2}' /proc/stat 2>/dev/null || echo 0)"
     fi
     echo "${_BOOT_TIME}"
+}
+
+# Get tuku operational mode (auto, ollama-first, llama-cpp-only)
+get_tuku_mode() {
+    local mode="${TUKU_MODE:-auto}"
+    
+    # Check config file first
+    if [[ -f "/etc/tuku/config" ]]; then
+        source "/etc/tuku/config" 2>/dev/null || true
+        [[ -n "${TUKU_MODE}" ]] && mode="${TUKU_MODE}"
+    fi
+    
+    echo "${mode}"
 }
 
 # Format seconds into human-readable uptime (with day support)
@@ -661,19 +682,25 @@ Options:
   --dry-run           Show what would happen without killing
   --verbose           Show detailed idle scoring for each process
   --json              Output results as JSON
-  --force             Skip --max-idle duration check; kill immediately if idle
-  --system            Manage ALL users' processes (for system cron)
-  --help, -h          Show this help message
+   --force             Skip --max-idle duration check; kill immediately if idle
+   --system            Manage ALL users' processes (for system cron)
+   --mode MODE         Set operational mode: auto, ollama-first, llama-cpp-only
+   --help, -h          Show this help message
 
 Scoring System:
-  No GPU memory at all ................ +3
-  GPU memory held, utilization 0% .... +3
-  No CPU time change since last run ... +3
-  No network connections (servers) .... +2
-  Running > 2 hours ................... +1
-  Running > 8 hours ................... +2
+   No GPU memory at all ................ +3
+   GPU memory held, utilization 0% .... +3
+   No CPU time change since last run ... +3
+   No network connections (servers) .... +2
+   Running > 2 hours ................... +1
+   Running > 8 hours ................... +2
 
-  Score >= 8 and idle for >= --max-idle minutes: KILL
+   Score >= threshold and idle for >= --max-idle minutes: KILL
+
+Thresholds by mode:
+   auto ............... score >= 8 (default)
+   ollama-first ....... score >= 12 (more lenient, prefer keeping llama.cpp)
+   llama-cpp-only ..... score >= 8 (aggressive reaping of idle processes)
 
 Examples:
   tuku reap                           # Run once in user mode
@@ -690,6 +717,7 @@ EOF
 cmd_reap() {
     local output_mode="default"
     local reap_results=()
+    local specified_mode="${TUKU_MODE:-auto}"
 
     # Parse reap-specific args
     while [[ $# -gt 0 ]]; do
@@ -705,10 +733,33 @@ cmd_reap() {
             --json)      output_mode="json"; shift ;;
             --force)     FORCE=true; shift ;;
             --system)    SYSTEM_MODE=true; shift ;;
+            --mode)
+                [[ -n "${2:-}" ]] || die "--mode requires a value (auto, ollama-first, llama-cpp-only)"
+                specified_mode="$2"
+                case "$specified_mode" in
+                    auto|ollama-first|llama-cpp-only) ;;
+                    *) die "Invalid mode: $specified_mode. Valid modes: auto, ollama-first, llama-cpp-only" ;;
+                esac
+                shift 2 ;;
             --help|-h)   usage_reap ;;
             *)           die "Unknown reap option: $1. Run 'tuku reap --help'." ;;
         esac
     done
+
+    # Determine effective mode and set threshold
+    local effective_mode="${TUKU_MODE:-auto}"
+    
+    # Command-line flag overrides environment/config file
+    [[ "${specified_mode}" != "${TUKU_MODE:-auto}" ]] && effective_mode="${specified_mode}"
+    
+    case "${effective_mode}" in
+        auto)
+            SCORE_KILL=8 ;;
+        ollama-first)
+            SCORE_KILL=12 ;;
+        llama-cpp-only)
+            SCORE_KILL=8 ;;
+    esac
 
     # Override state directories for system mode
     if [[ "${SYSTEM_MODE}" == true ]]; then
@@ -723,8 +774,8 @@ cmd_reap() {
 
     if [[ -z "${processes}" ]]; then
         if [[ "${output_mode}" == "json" ]]; then
-            printf '{"dry_run": %s, "score_threshold": %s, "min_age_minutes": %s, "max_idle_minutes": %s, "process_count": 0, "processes": []}\n' \
-                "${DRY_RUN}" "${SCORE_KILL}" "${MIN_AGE_MINUTES}" "${MAX_IDLE_MINUTES}"
+            printf '{"dry_run": %s, "score_threshold": %s, "min_age_minutes": %s, "max_idle_minutes": %s, "mode": "%s", "process_count": 0, "processes": []}\n' \
+                "${DRY_RUN}" "${SCORE_KILL}" "${MIN_AGE_MINUTES}" "${MAX_IDLE_MINUTES}" "${effective_mode}"
         else
             [[ "${VERBOSE}" == true ]] && echo "No llama.cpp processes found."
         fi
@@ -1220,6 +1271,8 @@ DASH_OTHER_USERS=()
 DASH_OTHER_VRAMS=()
 DASH_OTHER_CMDS=()
 DASH_OTHER_UPTIMES=()
+DASH_OTHER_CPU_TOTS=()
+DASH_OTHER_IDLE=()
 
 find_other_gpu_for_dashboard() {
     # Reset arrays
@@ -1228,6 +1281,8 @@ find_other_gpu_for_dashboard() {
     DASH_OTHER_VRAMS=()
     DASH_OTHER_CMDS=()
     DASH_OTHER_UPTIMES=()
+    DASH_OTHER_CPU_TOTS=()
+    DASH_OTHER_IDLE=()
 
     # Need GPU_VRAM_BY_PID from cache_gpu_data
     [[ ${#GPU_VRAM_BY_PID[@]} -eq 0 ]] && return 0
@@ -1277,8 +1332,8 @@ find_other_gpu_for_dashboard() {
 
         # Truncate command
         local cmd_display="${cmdline}"
-        if [[ ${#cmd_display} -gt 50 ]]; then
-            cmd_display="${cmd_display:0:47}..."
+        if [[ ${#cmd_display} -gt 35 ]]; then
+            cmd_display="${cmd_display:0:32}..."
         fi
         DASH_OTHER_CMDS+=("${cmd_display}")
 
@@ -1287,6 +1342,24 @@ find_other_gpu_for_dashboard() {
         else
             DASH_OTHER_UPTIMES+=("-")
         fi
+
+        # CPU total seconds
+        local cpu_ticks=""
+        cpu_ticks="$(get_cpu_time "${pid}" 2>/dev/null)" || cpu_ticks=""
+        local cpu_secs=0
+        if [[ -n "${cpu_ticks}" && "${cpu_ticks}" -gt 0 ]]; then
+            cpu_secs=$(( cpu_ticks / 100 ))
+            DASH_OTHER_CPU_TOTS+=("${cpu_secs}s")
+        else
+            DASH_OTHER_CPU_TOTS+=("-")
+        fi
+
+        # IDLE label: uptime > 1800s AND cpu_secs < 60
+        local idle_label="-"
+        if [[ "${elapsed_secs:-0}" -gt 1800 && "${cpu_secs}" -lt 60 ]]; then
+            idle_label="IDLE"
+        fi
+        DASH_OTHER_IDLE+=("${idle_label}")
     done
 }
 
@@ -1358,15 +1431,17 @@ render_other_gpu() {
     [[ ${#DASH_OTHER_PIDS[@]} -eq 0 ]] && return 0
 
     print_header "Other GPU Processes"
-    printf "  ${BOLD_WHITE}%-8s %-12s %-10s %-52s %s${RESET}\n" \
-        "PID" "USER" "GPU_MEM" "COMMAND" "UPTIME"
+    printf "  ${BOLD_WHITE}%-8s %-12s %-10s %-10s %-6s %-37s %s${RESET}\n" \
+        "PID" "USER" "GPU_MEM" "CPU_TOT" "IDLE" "COMMAND" "UPTIME"
 
     local i
     for ((i = 0; i < ${#DASH_OTHER_PIDS[@]}; i++)); do
-        printf "  %-8s %-12s %-10s %-52s %s\n" \
+        printf "  %-8s %-12s %-10s %-10s %-6s %-37s %s\n" \
             "${DASH_OTHER_PIDS[$i]}" \
             "${DASH_OTHER_USERS[$i]}" \
             "${DASH_OTHER_VRAMS[$i]}" \
+            "${DASH_OTHER_CPU_TOTS[$i]}" \
+            "${DASH_OTHER_IDLE[$i]}" \
             "${DASH_OTHER_CMDS[$i]}" \
             "${DASH_OTHER_UPTIMES[$i]}"
     done
@@ -1375,6 +1450,20 @@ render_other_gpu() {
 
 render_reaper() {
     print_header "Reaper"
+    
+    # Get current mode and threshold for display
+    local reaper_mode="${TUKU_MODE:-auto}"
+    if [[ -f "/etc/tuku/config" ]]; then
+        source "/etc/tuku/config" 2>/dev/null || true
+        [[ -n "${TUKU_MODE}" ]] && reaper_mode="${TUKU_MODE}"
+    fi
+    
+    local threshold=8
+    case "${reaper_mode}" in
+        ollama-first) threshold=12 ;;
+        llama-cpp-only|auto) threshold=8 ;;
+    esac
+    
     if [[ "${REAPER_STATUS}" == "active" ]]; then
         local detail=""
         local interval="${REAPER_INTERVAL:-1}"
@@ -1383,9 +1472,13 @@ render_reaper() {
         detail=" (every ${interval}m, min-age ${min_age}m, max-idle ${max_idle}m)"
         printf '  %b%-8s%b %b● active%s%b\n' \
             "${BOLD_WHITE}" "Status" "${RESET}" "${GREEN}" "${detail}" "${RESET}"
+        printf '  %b%-8s%b %bmode: %s (threshold: >=%d)%b\n' \
+            "${BOLD_WHITE}" "Mode" "${RESET}" "${CYAN}" "${reaper_mode}" "${threshold}" "${RESET}"
     else
         printf '  %b%-8s%b %b● not installed%b\n' \
             "${BOLD_WHITE}" "Status" "${RESET}" "${YELLOW}" "${RESET}"
+        printf '  %b%-8s%b %bmode: %s (threshold: >=%d)%b\n' \
+            "${BOLD_WHITE}" "Mode" "${RESET}" "${CYAN}" "${reaper_mode}" "${threshold}" "${RESET}"
     fi
 }
 
@@ -1450,6 +1543,8 @@ render_json() {
             printf '          "pid": %s,\n' "${DASH_OTHER_PIDS[$i]}"
             printf '          "user": "%s",\n' "$(json_escape "${DASH_OTHER_USERS[$i]}")"
             printf '          "gpu_mem": "%s",\n' "$(json_escape "${DASH_OTHER_VRAMS[$i]}")"
+            printf '          "cpu_total_seconds": "%s",\n' "$(json_escape "${DASH_OTHER_CPU_TOTS[$i]}")"
+            printf '          "idle": "%s",\n' "$(json_escape "${DASH_OTHER_IDLE[$i]}")"
             printf '          "command": "%s",\n' "$(json_escape "${DASH_OTHER_CMDS[$i]}")"
             printf '          "uptime": "%s"\n' "$(json_escape "${DASH_OTHER_UPTIMES[$i]}")"
             printf '        }'
@@ -1462,12 +1557,26 @@ render_json() {
     printf '    },\n'
 
     printf '  "reaper": {\n'
+    # Get current mode for display (same logic as render_reaper)
+    local reaper_mode="${TUKU_MODE:-auto}"
+    if [[ -f "/etc/tuku/config" ]]; then
+        source "/etc/tuku/config" 2>/dev/null || true
+        [[ -n "${TUKU_MODE}" ]] && reaper_mode="${TUKU_MODE}"
+    fi
+    
     printf '    "status": "%s"' "${REAPER_STATUS}"
     if [[ "${REAPER_STATUS}" == "active" ]]; then
         printf ',\n    "interval_minutes": "%s"' "${REAPER_INTERVAL:-1}"
         printf ',\n    "min_age_minutes": "%s"' "${REAPER_MIN_AGE:-60}"
         printf ',\n    "max_idle_minutes": "%s"' "${REAPER_MAX_IDLE:-30}"
     fi
+    printf ',\n    "mode": "%s"' "${reaper_mode}"
+    local threshold=8
+    case "${reaper_mode}" in
+        ollama-first) threshold=12 ;;
+        llama-cpp-only|auto) threshold=8 ;;
+    esac
+    printf ',\n    "threshold": %d' "${threshold}"
     printf '\n  }\n'
 
     printf '}\n'

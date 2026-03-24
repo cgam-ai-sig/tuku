@@ -8,6 +8,8 @@ readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly SCRIPTS=("tuku")
 readonly INSTALL_DIR="/usr/local/bin"
 readonly STATE_DIR="/var/lib/tuku"
+readonly CONFIG_DIR="/etc/tuku"
+readonly CONFIG_FILE="${CONFIG_DIR}/config"
 
 # ---------- Colors ----------
 
@@ -46,7 +48,8 @@ What it does:
   1. Copies tuku to /usr/local/bin/
   2. Sets ownership root:root, mode 0755
   3. Creates /var/lib/tuku/ for system-mode state
-  4. Optionally installs system reaper cron (--with-reaper)
+  4. Creates /etc/tuku/config with default operational mode (auto)
+  5. Optionally installs system reaper cron (--with-reaper)
 
 Must be run as root (sudo ./install.sh).
 
@@ -120,7 +123,30 @@ do_install() {
         warn "/var/log/ missing (unexpected)"
     fi
 
-    # 4. Optionally install system reaper cron
+    # 4. Create config directory and default config file
+    if [[ ! -d "${CONFIG_DIR}" ]]; then
+        mkdir -p "${CONFIG_DIR}"
+        check "Created ${CONFIG_DIR}/"
+    else
+        check "${CONFIG_DIR}/ already exists"
+    fi
+    
+    if [[ ! -f "${CONFIG_FILE}" ]]; then
+        cat > "${CONFIG_FILE}" <<'EOF'
+# tuku operational mode configuration
+# Uncomment and modify to set a different default mode:
+# TUKU_MODE="auto"              # Default: score >= 8
+# TUKU_MODE="ollama-first"      # Prefer keeping llama.cpp processes: score >= 12
+# TUKU_MODE="llama-cpp-only"    # Aggressive reaping: score >= 8
+
+TUKU_MODE="auto"
+EOF
+        check "Created ${CONFIG_FILE} (default mode: auto)"
+    else
+        check "${CONFIG_FILE} already exists (skipping default config)"
+    fi
+
+    # 5. Optionally install system reaper cron
     if [[ "${with_reaper}" == true ]]; then
         echo ""
         printf "${BOLD}Installing system reaper cron...${RESET}\n"
